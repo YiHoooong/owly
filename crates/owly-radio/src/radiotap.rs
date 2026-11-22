@@ -21,6 +21,7 @@ const CHANNEL: u32 = 3;
 const DBM_ANTSIGNAL: u32 = 5;
 const TX_FLAGS: u32 = 15;
 const MCS: u32 = 19;
+const VHT: u32 = 21;
 const EXT: u32 = 31;
 
 const F_FCS: u8 = 0x10;
@@ -142,6 +143,34 @@ pub fn tx_header(rate: TxRate, no_ack: bool) -> Vec<u8> {
             present |= 1 << MCS;
             // Known: bandwidth, MCS, guard interval. 20 MHz.
             fields.extend_from_slice(&[0x07, if sgi { 0x04 } else { 0 }, mcs]);
+        }
+        TxRate::Vht {
+            mcs,
+            nss,
+            bw_mhz,
+            sgi,
+        } => {
+            if no_ack {
+                present |= 1 << TX_FLAGS;
+                fields.extend_from_slice(&F_TX_NOACK.to_le_bytes());
+            }
+            present |= 1 << VHT;
+            // Radiotap VHT (bit 21, 2-byte aligned, 12 bytes):
+            // known (u16 LE): GI (0x0004) | BW (0x0040) = 0x0044
+            // flags (u8): SGI = 0x04
+            // bandwidth (u8): 0=20, 1=40, 4=80
+            // mcs_nss[0]: (mcs << 4) | nss
+            // coding: 0x01 (LDPC)
+            let flags = if sgi { 0x04 } else { 0x00 };
+            let bw = match bw_mhz {
+                80 => 4,
+                40 => 1,
+                _ => 0,
+            };
+            let mcs_nss = ((mcs & 0x0f) << 4) | (nss.clamp(1, 4) & 0x0f);
+            fields.extend_from_slice(&[
+                0x44, 0x00, flags, bw, mcs_nss, 0, 0, 0, 0x01, 0, 0, 0,
+            ]);
         }
     }
     let len = 8 + fields.len();

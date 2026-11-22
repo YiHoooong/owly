@@ -134,10 +134,15 @@ if (-not $SkipRadio) {
     Write-Host "[demo] Radio: $radioExe (ch=$Channel, width=${effWidth}MHz, fw=$fwDir)" -ForegroundColor Green
 
     if (-not $NoSystem) {
-        # Launch as SYSTEM so SeLockMemoryPrivilege is available for DMA buffer allocation on Windows 11
+        # Launch as SYSTEM via a short .cmd wrapper so schtasks /TR stays well under
+        # its 261-character limit and full mtkradio logs (including HW TX/RX BA) are captured.
         if (Test-Path $radioLog) { Remove-Item $radioLog -Force }
-        $cmd = "cmd.exe /c `"`"$radioExe`" $Channel --width $effWidth --firmware `"$fwDir`" --no-block-ack --verbose > `"$radioLog`" 2>&1`""
-        schtasks /Create /F /RU SYSTEM /SC ONCE /ST 00:00 /TN $taskName /TR $cmd | Out-Null
+        $radioCmd = Join-Path $repo 'run-mtkradio.cmd'
+        @(
+            '@echo off'
+            "`"$radioExe`" $Channel --width $effWidth --firmware `"$fwDir`" --no-block-ack --verbose > `"$radioLog`" 2>&1"
+        ) | Set-Content -Path $radioCmd -Encoding ASCII
+        schtasks /Create /F /RU SYSTEM /SC ONCE /ST 00:00 /TN $taskName /TR "cmd.exe /c `"$radioCmd`"" | Out-Null
         schtasks /Run /TN $taskName | Out-Null
         $usedSystemTask = $true
         Write-Host "[demo] Started mtkradio.exe as SYSTEM (log: $radioLog)" -ForegroundColor Cyan

@@ -15,6 +15,7 @@ other-libs
 # Windows demo runtime artifacts.
 /received/
 *.log
+run-mtkradio.cmd
 wintun.dll
 
 .readme-preview.html

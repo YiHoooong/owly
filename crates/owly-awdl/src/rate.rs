@@ -18,6 +18,13 @@ pub enum TxRate {
     Legacy(u8),
     /// An HT MCS on 20 MHz.
     Ht { mcs: u8, sgi: bool },
+    /// A VHT MCS with `nss` spatial streams (1..=4) and bandwidth (20, 40, or 80 MHz).
+    Vht {
+        mcs: u8,
+        nss: u8,
+        bw_mhz: u8,
+        sgi: bool,
+    },
 }
 
 impl TxRate {
@@ -52,6 +59,8 @@ impl TxRate {
                 }
             }
             (TxRate::Ht { .. }, _) => TxRate::BASIC,
+            (TxRate::Vht { .. }, Some(_)) => self,
+            (TxRate::Vht { .. }, None) => TxRate::BASIC,
         }
     }
 }
@@ -63,6 +72,19 @@ impl fmt::Display for TxRate {
             TxRate::Legacy(r) => write!(f, "{}.5 Mbit/s", r / 2),
             TxRate::Ht { mcs, sgi } => {
                 write!(f, "HT MCS {mcs}")?;
+                if sgi {
+                    f.write_str(", short GI")
+                } else {
+                    Ok(())
+                }
+            }
+            TxRate::Vht {
+                mcs,
+                nss,
+                bw_mhz,
+                sgi,
+            } => {
+                write!(f, "VHT MCS {mcs} {nss}SS {bw_mhz}MHz")?;
                 if sgi {
                     f.write_str(", short GI")
                 } else {

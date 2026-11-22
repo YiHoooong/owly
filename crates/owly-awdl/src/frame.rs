@@ -113,6 +113,13 @@ pub enum Received<'a> {
         params: u16,
         timeout: u16,
     },
+    /// A peer's response to our ADDBA Request.
+    AddBaResponse {
+        header: Header,
+        token: u8,
+        status: u16,
+        params: u16,
+    },
     /// An AWDL data frame: one MSDU, or an A-MSDU.
     Data {
         header: Header,
@@ -190,6 +197,14 @@ fn action(header: Header, body: &[u8]) -> Result<Received<'_>, Error> {
             token: b.u8(2)?,
             params: b.le16(3)?,
             timeout: b.le16(5)?,
+        });
+    }
+    if b.u8(0)? == CATEGORY_BLOCK_ACK && b.u8(1)? == ADDBA_RESPONSE {
+        return Ok(Received::AddBaResponse {
+            header,
+            token: b.u8(2)?,
+            status: b.le16(3)?,
+            params: b.le16(5)?,
         });
     }
     if body.len() < ACTION_HEADER_LEN
@@ -344,6 +359,47 @@ pub fn amsdu_frame(
         out.be16((DATA_HEADER_LEN + p.len()) as u16);
         put_msdu(&mut out, awdl_seq.wrapping_add(i as u16), p);
     }
+    out
+}
+
+/// A single QoS Data frame (TID 0, A-MSDU = 0) so Block Ack / A-MPDU radios
+/// can aggregate unicast frames into A-MPDUs.
+pub fn qos_data_frame(
+    src: MacAddr,
+    dst: MacAddr,
+    seq: u16,
+    awdl_seq: u16,
+    packet: &[u8],
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(HEADER_LEN + 2 + DATA_HEADER_LEN + packet.len());
+    put_header(&mut out, fc::QOS_DATA, dst, src, seq);
+    out.le16(0x0000); // QoS control: TID 0, normal ACK, A-MSDU = 0
+    put_msdu(&mut out, awdl_seq, packet);
+    out
+}
+
+/// An 802.11 ADDBA Request (Category 3, Action 0, TID 0, Immediate BA) to
+/// initiate a TX Block Ack / A-MPDU session with a peer.
+pub fn addba_request(
+    src: MacAddr,
+    dst: MacAddr,
+    seq: u16,
+    token: u8,
+    amsdu: bool,
+    window: u16,
+    start_seq: u16,
+) -> Vec<u8> {
+    let win = window.clamp(1, 64);
+    let params = (win << 6) | 0x0002 | u16::from(amsdu); // TID 0, Immediate BA
+    let ssn = (start_seq & 0x0fff) << 4;
+    let mut out = Vec::with_capacity(HEADER_LEN + 9);
+    put_header(&mut out, fc::ACTION, dst, src, seq);
+    out.u8(CATEGORY_BLOCK_ACK);
+    out.u8(ADDBA_REQUEST);
+    out.u8(token);
+    out.le16(params);
+    out.le16(0); // BA timeout = 0 (never)
+    out.le16(ssn);
     out
 }
 

@@ -34,6 +34,12 @@ pub struct Peer {
     /// It has sent a MIF and announced its version and device class: only
     /// then is it a peer to talk to (AWDL-17).
     pub valid: bool,
+    /// Whether this peer has accepted our TX Block Ack (TID 0) session.
+    pub(crate) tx_ba_active: bool,
+    /// When we last sent an ADDBA Request to this peer.
+    pub(crate) tx_ba_last_req: Option<Time>,
+    /// Next ADDBA Request dialog token for this peer.
+    pub(crate) tx_ba_token: u8,
 }
 
 /// What a host is told about a peer that has turned valid.
@@ -62,6 +68,9 @@ impl Peer {
             mif: false,
             v2: false,
             valid: false,
+            tx_ba_active: false,
+            tx_ba_last_req: None,
+            tx_ba_token: 0,
         }
     }
 

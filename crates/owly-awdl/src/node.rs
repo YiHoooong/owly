@@ -109,6 +109,9 @@ pub struct Config {
     pub no_ack: bool,
     /// Accept a peer's Block Ack session (AWDL-15).
     pub accept_addba: bool,
+    /// Initiate a TX Block Ack session (ADDBA Request, TID 0) and send
+    /// unicast frames as QoS Data so the radio can aggregate TX A-MPDUs.
+    pub initiate_addba: bool,
     /// Send unicast packets to one peer as A-MSDUs, up to the peer's limit.
     pub amsdu: bool,
     /// The largest frame the radio takes, MAC header included.
@@ -137,6 +140,7 @@ impl Config {
             rate: TxRate::BASIC,
             no_ack,
             accept_addba: false,
+            initiate_addba: false,
             amsdu: false,
             max_frame: 2304,
             rssi_threshold: Some(-65),
@@ -396,6 +400,17 @@ impl Node {
                     },
                 });
             }
+            Received::AddBaResponse {
+                header,
+                status,
+                ..
+            } if self.cfg.initiate_addba && header.dst == self.cfg.addr => {
+                if status == 0
+                    && let Some(peer) = self.peers.get_mut(&header.src)
+                {
+                    peer.tx_ba_active = true;
+                }
+            }
             Received::Data {
                 header,
                 amsdu,
@@ -452,6 +467,7 @@ impl Node {
         if up {
             let info = peer.info();
             out.push(Action::PeerUp(info));
+            self.maybe_initiate_addba(now, src, out);
             self.release_syns(src, out);
         }
     }
@@ -819,12 +835,12 @@ impl Node {
                 waiting.push_back(q);
                 continue;
             }
-            let peer = &self.peers[&dst];
-            let rate = self.cfg.rate.for_peer(peer.ht.as_ref());
+            let peer_ht = self.peers[&dst].ht;
+            let rate = self.cfg.rate.for_peer(peer_ht.as_ref());
+            self.maybe_initiate_addba(now, dst, out);
             let mut batch = Vec::from([q]);
-            if self.cfg.amsdu && peer.ht.is_some() {
-                let limit = peer
-                    .ht
+            if self.cfg.amsdu && peer_ht.is_some() {
+                let limit = peer_ht
                     .map_or(AMSDU_DEFAULT_MAX, |h| h.max_amsdu())
                     .min(self.cfg.max_frame.saturating_sub(frame::HEADER_LEN + 2));
                 let mut len = frame::amsdu_subframe_len(batch[0].packet.data.len());
@@ -844,7 +860,11 @@ impl Node {
             let awdl_seq = self.awdl_seq;
             self.awdl_seq = self.awdl_seq.wrapping_add(batch.len() as u16);
             let bytes = if batch.len() == 1 {
-                frame::data_frame(self.cfg.addr, dst, seq, awdl_seq, &batch[0].packet.data)
+                if self.cfg.initiate_addba && peer_ht.is_some() {
+                    frame::qos_data_frame(self.cfg.addr, dst, seq, awdl_seq, &batch[0].packet.data)
+                } else {
+                    frame::data_frame(self.cfg.addr, dst, seq, awdl_seq, &batch[0].packet.data)
+                }
             } else {
                 let packets: Vec<&[u8]> = batch.iter().map(|q| q.packet.data.as_slice()).collect();
                 self.stats.tx_amsdu += 1;
@@ -863,6 +883,47 @@ impl Node {
             });
         }
         self.unicast = waiting;
+    }
+
+    fn maybe_initiate_addba(&mut self, now: Time, dst: MacAddr, out: &mut Vec<Action>) {
+        if !self.cfg.initiate_addba {
+            return;
+        }
+        let need_addba = self.peers.get(&dst).is_some_and(|p| {
+            p.ht.is_some()
+                && !p.tx_ba_active
+                && p.tx_ba_last_req
+                    .is_none_or(|t| now.since(t) >= 2_000_000)
+        });
+        if !need_addba {
+            return;
+        }
+        let req_seq = self.next_seq();
+        let start_seq = self.seq;
+        let token = {
+            let p = self.peers.get_mut(&dst).unwrap();
+            p.tx_ba_last_req = Some(now);
+            p.tx_ba_token = p.tx_ba_token.wrapping_add(1).max(1);
+            p.tx_ba_token
+        };
+        let req = frame::addba_request(
+            self.cfg.addr,
+            dst,
+            req_seq,
+            token,
+            self.cfg.amsdu,
+            64,
+            start_seq,
+        );
+        out.push(Action::Transmit {
+            at: now,
+            frame: Frame {
+                bytes: req,
+                to: dst,
+                rate: TxRate::BASIC,
+                no_ack: false,
+            },
+        });
     }
 
     /// When to be called back.

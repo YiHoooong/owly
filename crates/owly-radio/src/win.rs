@@ -309,6 +309,31 @@ fn write_tx_radiotap(out: &mut Vec<u8>, rate: TxRate, no_ack: bool) {
                 out.extend_from_slice(&[0, 0, 11, 0, 0, 0, 0x08, 0, 0x07, flags, mcs]);
             }
         }
+        TxRate::Vht {
+            mcs,
+            nss,
+            bw_mhz,
+            sgi,
+        } => {
+            let flags = if sgi { 0x04 } else { 0x00 };
+            let bw = match bw_mhz {
+                80 => 4,
+                40 => 1,
+                _ => 0,
+            };
+            let mcs_nss = ((mcs & 0x0f) << 4) | (nss.clamp(1, 4) & 0x0f);
+            if no_ack {
+                out.extend_from_slice(&[
+                    0, 0, 22, 0, 0, 0x80, 0x20, 0, 0x08, 0, 0x44, 0x00, flags, bw, mcs_nss, 0, 0,
+                    0, 0x01, 0, 0, 0,
+                ]);
+            } else {
+                out.extend_from_slice(&[
+                    0, 0, 20, 0, 0, 0, 0x20, 0, 0x44, 0x00, flags, bw, mcs_nss, 0, 0, 0, 0x01, 0,
+                    0, 0,
+                ]);
+            }
+        }
     }
 }
 
@@ -840,6 +865,24 @@ mod tests {
             TxRate::Ht { mcs: 0, sgi: false },
             TxRate::Ht { mcs: 7, sgi: true },
             TxRate::Ht { mcs: 15, sgi: true },
+            TxRate::Vht {
+                mcs: 7,
+                nss: 2,
+                bw_mhz: 80,
+                sgi: true,
+            },
+            TxRate::Vht {
+                mcs: 9,
+                nss: 2,
+                bw_mhz: 80,
+                sgi: false,
+            },
+            TxRate::Vht {
+                mcs: 5,
+                nss: 1,
+                bw_mhz: 40,
+                sgi: true,
+            },
         ] {
             for no_ack in [false, true] {
                 let mut buf = Vec::new();

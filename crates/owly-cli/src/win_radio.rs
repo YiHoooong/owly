@@ -41,20 +41,54 @@ pub fn start_mtkradio(
             presence: Presence::Fixed,
         },
     );
-    cfg.rate = TxRate::Ht { mcs: 7, sgi: true };
-    cfg.no_ack = true;
+    let rate = select_tx_rate(ch_num);
+    let amsdu = std::env::var("OWLY_NO_AMSDU")
+        .map(|v| v.trim() != "1")
+        .unwrap_or(true);
+    let no_ack = std::env::var("OWLY_NO_ACK")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    cfg.rate = rate;
+    cfg.no_ack = no_ack;
     cfg.accept_addba = true;
-    cfg.amsdu = true;
+    cfg.initiate_addba = true;
+    cfg.amsdu = amsdu;
     cfg.max_frame = 4000;
 
     let link_local = cfg.addr.link_local();
     let (peers_tx, peers_rx) = watch::channel(Vec::new());
     let native = Native::start_pipe(pipe, iface, cfg, peers_tx)?;
     eprintln!(
-        "[owly-win] {iface} up (ifindex={}, ip={link_local}, pipe={pipe}, ch={ch_num}, Fixed+ADDBA+AMSDU+VHT80-2x2)",
+        "[owly-win] {iface} up (ifindex={}, ip={link_local}, pipe={pipe}, ch={ch_num}, rate={rate}, no_ack={no_ack}, RX+TX-ADDBA, amsdu={amsdu})",
         native.index
     );
     Ok((native, peers_rx, link_local))
+}
+
+fn select_tx_rate(ch_num: u32) -> TxRate {
+    if ch_num <= 14 {
+        return TxRate::Ht { mcs: 7, sgi: true };
+    }
+    if let Ok(val) = std::env::var("OWLY_VHT_MCS") {
+        let v = val.trim();
+        if v.eq_ignore_ascii_case("ht7") {
+            return TxRate::Ht { mcs: 7, sgi: true };
+        }
+        if let Ok(mcs) = v.parse::<u8>() {
+            return TxRate::Vht {
+                mcs: mcs.min(9),
+                nss: 2,
+                bw_mhz: 80,
+                sgi: true,
+            };
+        }
+    }
+    TxRate::Vht {
+        mcs: 7,
+        nss: 2,
+        bw_mhz: 80,
+        sgi: true,
+    }
 }
 
 /// `owly radio up` on Windows: brings up Wintun `awdl0` connected to
