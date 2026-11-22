@@ -16,12 +16,22 @@
 //!   the monitor interface of the session that's up. Takes root.
 
 mod airdrop;
+#[cfg(target_os = "linux")]
 mod bluez;
+#[cfg(target_os = "linux")]
 mod capture;
+#[cfg(target_os = "linux")]
 mod doctor;
+#[cfg(target_os = "linux")]
 mod radio;
+#[cfg(target_os = "linux")]
 mod test_card;
+#[cfg(target_os = "linux")]
 mod wifi;
+#[cfg(windows)]
+mod win_ble;
+#[cfg(windows)]
+mod win_radio;
 
 use std::process::ExitCode;
 
@@ -40,11 +50,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// What the Wi-Fi card can do here, and what stands in the way.
+    #[cfg(target_os = "linux")]
     Doctor {
         #[arg(long)]
         json: bool,
     },
-    /// The radio, through owlyd.
+    /// The radio, through owlyd (Linux) or mtkradio Named Pipe (Windows).
     #[command(subcommand)]
     Radio(Radio),
     /// Receive files and links in Everyone mode.
@@ -54,14 +65,17 @@ enum Command {
     /// List the receivers that answer /Discover.
     Browse(airdrop::BrowseArgs),
     /// Test this computer's Wi-Fi card with an iPhone, and write a report.
+    #[cfg(target_os = "linux")]
     TestCard(test_card::Args),
     /// Record an AWDL session with a phone for tests/captures (root).
+    #[cfg(target_os = "linux")]
     Capture(capture::Args),
 }
 
 #[derive(Subcommand)]
 enum Radio {
     /// The same as `owly doctor`.
+    #[cfg(target_os = "linux")]
     Probe {
         #[arg(long)]
         json: bool,
@@ -71,15 +85,30 @@ enum Radio {
         /// Give it back after this many seconds.
         #[arg(long = "for", value_name = "SECONDS", default_value_t = 0)]
         duration: u32,
+        /// Windows Named Pipe served by mtkradio.exe.
+        #[cfg(windows)]
+        #[arg(long, default_value = owly_radio::native::DEFAULT_PIPE)]
+        pipe: String,
+        /// Wintun interface name.
+        #[cfg(windows)]
+        #[arg(long, default_value = "awdl0")]
+        iface: String,
+        /// AWDL channel (6, 44, or 149).
+        #[cfg(windows)]
+        #[arg(long, default_value_t = 149)]
+        channel: u32,
     },
     /// The AWDL peers of the session that's up.
+    #[cfg(target_os = "linux")]
     Peers,
 }
 
 fn main() -> ExitCode {
+    let default_filter = if cfg!(windows) { "info" } else { "warn" };
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| default_filter.into()),
         )
         .with_writer(std::io::stderr)
         .init();
@@ -88,15 +117,27 @@ fn main() -> ExitCode {
     let bus = cli.bus.as_deref();
     let result = rt.block_on(async {
         match cli.command {
+            #[cfg(target_os = "linux")]
             Command::Doctor { json } | Command::Radio(Radio::Probe { json }) => {
                 doctor::run(bus, json).await
             }
+            #[cfg(target_os = "linux")]
             Command::Radio(Radio::Up { duration }) => radio::up(bus, duration).await,
+            #[cfg(windows)]
+            Command::Radio(Radio::Up {
+                duration,
+                pipe,
+                iface,
+                channel,
+            }) => win_radio::up(&pipe, &iface, channel, duration).await,
+            #[cfg(target_os = "linux")]
             Command::Radio(Radio::Peers) => radio::peers(bus).await,
             Command::Receive(args) => airdrop::receive(bus, args).await,
             Command::Send(args) => airdrop::send(bus, args).await,
             Command::Browse(args) => airdrop::browse(bus, args).await,
+            #[cfg(target_os = "linux")]
             Command::TestCard(args) => test_card::run(bus, args).await,
+            #[cfg(target_os = "linux")]
             Command::Capture(args) => capture::run(args).await,
         }
     });

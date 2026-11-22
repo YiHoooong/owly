@@ -12,4 +12,9 @@ other-libs
 # Cargo build output.
 /target/
 
+# Windows demo runtime artifacts.
+/received/
+*.log
+wintun.dll
+
 .readme-preview.html

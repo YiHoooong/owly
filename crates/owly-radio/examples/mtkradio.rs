@@ -71,7 +71,12 @@ fn main() {
     });
 
     let args: Vec<String> = env::args().collect();
-    let sock = args.get(1).map(|s| s.as_str()).unwrap_or("/tmp/mtkradio.sock");
+    let default_sock = if cfg!(windows) {
+        r"\\.\pipe\winawdl-radio"
+    } else {
+        "/tmp/mtkradio.sock"
+    };
+    let sock = args.get(1).map(|s| s.as_str()).unwrap_or(default_sock);
     let ch_num: u32 = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(149);
     let freq_mhz = if ch_num <= 13 {
         2407 + ch_num * 5

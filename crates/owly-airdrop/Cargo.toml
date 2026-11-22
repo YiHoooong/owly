@@ -20,6 +20,7 @@ tokio = [
     "dep:rcgen",
     "dep:p256",
     "dep:getrandom",
+    "dep:socket2",
     "dep:tempfile",
     "dep:tracing",
     "dep:nix",

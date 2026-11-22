@@ -77,31 +77,56 @@ impl Sender {
     }
 
     async fn connect(&self, addr: SocketAddrV6) -> io::Result<TlsStream<TcpStream>> {
+        tracing::info!("airdrop: TCP connecting to {addr}");
         let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
             .await
-            .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("TCP connect to {addr} timed out"),
+                )
+            })??;
         stream.set_nodelay(true)?;
-        timeout(
+        let sock = socket2::SockRef::from(&stream);
+        let _ = sock.set_send_buffer_size(2 << 20);
+        let _ = sock.set_recv_buffer_size(2 << 20);
+        tracing::info!("airdrop: TCP connected to {addr}, starting TLS handshake");
+        let tls = timeout(
             CONNECT_TIMEOUT,
             self.connector.connect(tls::server_name(), stream),
         )
         .await
-        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))?
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("TLS handshake with {addr} timed out"),
+            )
+        })??;
+        tracing::info!("airdrop: TLS connected to {addr}");
+        Ok(tls)
     }
 
     /// `/Discover` on a connection of its own (DISCOVERING in §8.1).
     /// `None` if the receiver doesn't want to be listed (DISC-1).
     pub async fn discover(&self, addr: SocketAddrV6) -> io::Result<Option<Receiver>> {
         let mut tls = self.connect(addr).await?;
+        tracing::info!("airdrop: sending /Discover to {addr}");
         let response = timeout(DISCOVER_TIMEOUT, async {
             tls.write_all(&sender::discover_request()).await?;
             tls.flush().await?;
             read_response(&mut tls).await
         })
         .await
-        .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
+        .map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("/Discover HTTP response from {addr} timed out"),
+            )
+        })??;
         let _ = tls.shutdown().await;
-        Ok(sender::parse_discover_response(&response))
+        let parsed = sender::parse_discover_response(&response);
+        tracing::info!("airdrop: /Discover from {addr} -> {:?}", parsed.as_ref().map(|r| &r.computer_name));
+        Ok(parsed)
     }
 
     /// Asks the receiver at `addr` to take `payload`, and uploads it if it
@@ -211,21 +236,31 @@ async fn upload<S: AsyncWriteExt + Unpin>(
     events: Option<&mpsc::UnboundedSender<Event>>,
 ) -> io::Result<()> {
     let total = file.metadata().await?.len();
-    write(stream, head).await?;
-    let mut buf = vec![0; 64 << 10];
+    write_no_flush(stream, head).await?;
+    let mut buf = vec![0; 256 << 10];
     let mut sent = 0;
     loop {
         let n = file.read(&mut buf).await?;
         if n == 0 {
             break;
         }
-        write(stream, &buf[..n]).await?;
+        write_no_flush(stream, &buf[..n]).await?;
         sent += n as u64;
         if let Some(events) = events {
             let _ = events.send(Event::Progress(Progress { sent, total }));
         }
     }
+    timeout(WRITE_TIMEOUT, stream.flush())
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the receiver stopped reading"))??;
     Ok(())
+}
+
+/// Writes `bytes` without forcing a per-chunk TLS flush, failing if the receiver stalls.
+async fn write_no_flush<S: AsyncWriteExt + Unpin>(stream: &mut S, bytes: &[u8]) -> io::Result<()> {
+    timeout(WRITE_TIMEOUT, stream.write_all(bytes))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "the receiver stopped reading"))?
 }
 
 /// Writes and flushes `bytes`, failing if the receiver stalls.

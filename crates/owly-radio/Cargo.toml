@@ -11,7 +11,6 @@ categories = ["network-programming", "os::linux-apis", "hardware-support"]
 
 [dependencies]
 crc32fast = "1"
-nix = { version = "0.31", default-features = false, features = ["fs", "net", "process", "signal", "socket", "time"] }
 owly-awdl = { version = "0.4.3", path = "../owly-awdl", features = ["driver"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -19,10 +18,27 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process"
 toml = "0.9"
 tracing = "0.1"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["fs", "net", "process", "signal", "socket", "time"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Media",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Threading",
+] }
+
 [dev-dependencies]
-nix = { version = "0.31", default-features = false, features = ["user"] }
 tempfile = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "test-util"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+nix = { version = "0.31", default-features = false, features = ["user"] }
 
 [lints]
 workspace = true

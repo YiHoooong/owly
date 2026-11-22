@@ -8,19 +8,36 @@
 //! it, with the settings [`config`] reads from `/etc/owly/radio.toml`.
 //! [`fake`] is a backend for testing what runs on top.
 
+#[cfg(target_os = "linux")]
 pub mod capture;
+#[cfg(target_os = "linux")]
 pub mod config;
+#[cfg(target_os = "linux")]
 pub mod fake;
+#[cfg(target_os = "linux")]
 pub mod injection;
+#[cfg(target_os = "linux")]
 pub mod journal;
+#[cfg(target_os = "linux")]
 pub mod native;
+#[cfg(windows)]
+#[path = "win.rs"]
+pub mod native;
+#[cfg(target_os = "linux")]
 pub mod netlink;
+#[cfg(target_os = "linux")]
 pub mod nl80211;
 pub mod pcap;
+#[cfg(target_os = "linux")]
 pub mod probe;
+#[cfg(target_os = "linux")]
 pub mod quirks;
+#[cfg(target_os = "linux")]
 pub mod radio;
 pub mod radiotap;
+#[cfg(target_os = "linux")]
 pub mod rtnl;
+#[cfg(target_os = "linux")]
 pub mod rundir;
+#[cfg(target_os = "linux")]
 pub mod sys;

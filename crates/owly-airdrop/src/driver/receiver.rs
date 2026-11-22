@@ -283,11 +283,14 @@ struct Task {
 impl Task {
     async fn run(self, stream: TcpStream, held: &Held) -> io::Result<()> {
         stream.set_nodelay(true)?;
+        let sock = socket2::SockRef::from(&stream);
+        let _ = sock.set_recv_buffer_size(2 << 20);
+        let _ = sock.set_send_buffer_size(2 << 20);
         let mut tls = timeout(HANDSHAKE_TIMEOUT, self.acceptor.accept(stream))
             .await
             .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
         let mut conn = Connection::new(self.config.clone());
-        let mut buf = vec![0; 64 << 10];
+        let mut buf = vec![0; 256 << 10];
         let mut timer: Option<Instant> = None;
         let idle_timeout = self.options.idle_timeout;
         let mut idle = Instant::now() + idle_timeout;

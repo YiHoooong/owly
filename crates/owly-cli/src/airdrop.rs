@@ -19,17 +19,27 @@ use owly_airdrop::driver::mdns::Mdns;
 use owly_airdrop::driver::receiver::{Options, Receiver, ReceiverEvent};
 use owly_airdrop::driver::sender::{Event, Payload, Sender};
 use owly_airdrop::driver::tls::Identity;
+#[cfg(target_os = "linux")]
 use owly_airdrop::proto::ble::Advert;
 use owly_airdrop::proto::mdns::{self, BrowseEvent, RECEIVER_FLAGS, SUPPORTS_DVZIP, Service};
 use owly_airdrop::proto::messages::Offer;
 use owly_airdrop::proto::receiver::Config;
 use owly_airdrop::proto::sender::{self, Outcome};
 use owly_awdl::MacAddr;
+#[cfg(windows)]
+use owly_awdl::PeerInfo;
+#[cfg(target_os = "linux")]
 use owly_radio::radio::Announce;
+#[cfg(windows)]
+use owly_radio::native::Native;
+#[cfg(target_os = "linux")]
 use owlyd::api::{self, LinkInfo, RadioProxy};
 use tokio::io::AsyncBufReadExt;
 
+#[cfg(target_os = "linux")]
 use crate::bluez::{BluezAdvertiser, Registration};
+#[cfg(windows)]
+use crate::win_ble::WinBleAdvert;
 
 /// Apple's receivers listen here (MDNS-1), and an AWDL peer with no mDNS
 /// is tried here (DISC-5).
@@ -49,6 +59,15 @@ pub struct On {
     /// The name others see (default: the host name).
     #[arg(long)]
     name: Option<String>,
+    /// Connect directly to mtkradio.exe over this Windows Named Pipe and bring
+    /// up Wintun in-process (e.g. `\\.\pipe\winawdl-radio`).
+    #[cfg(windows)]
+    #[arg(long)]
+    pipe: Option<String>,
+    /// AWDL channel when `--pipe` is used (6, 44, or 149).
+    #[cfg(windows)]
+    #[arg(long, default_value_t = 149)]
+    channel: u32,
 }
 
 #[derive(clap::Args)]
@@ -111,7 +130,8 @@ pub struct SendArgs {
 }
 
 impl On {
-    fn resolve(&self) -> io::Result<(Interface, String)> {
+    #[cfg(target_os = "linux")]
+    fn resolve(&self) -> io::Result<(Interface, String, Option<Lease>)> {
         // rustls needs a crypto provider chosen; ring is owly-cli's.
         let _ = rustls::crypto::ring::default_provider().install_default();
         let iface = Interface::lookup(&self.iface)?;
@@ -119,21 +139,62 @@ impl On {
             Some(name) => name.clone(),
             None => nix::unistd::gethostname()?.to_string_lossy().into_owned(),
         };
-        Ok((iface, name))
+        Ok((iface, name, None))
+    }
+
+    #[cfg(windows)]
+    fn resolve(&self) -> io::Result<(Interface, String, Option<Lease>)> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let name = match &self.name {
+            Some(name) => name.clone(),
+            None => std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows".into()),
+        };
+        if let Some(pipe) = &self.pipe {
+            let (native, peers, addr) =
+                crate::win_radio::start_mtkradio(pipe, &self.iface, self.channel, &name)?;
+            let iface = Interface {
+                name: self.iface.clone(),
+                index: native.index,
+                addr,
+            };
+            return Ok((
+                iface,
+                name,
+                Some(Lease {
+                    native: Some(native),
+                    peers,
+                }),
+            ));
+        }
+        let iface = Interface::lookup(&self.iface)?;
+        Ok((iface, name, None))
     }
 }
 
 /// `owly receive`.
 pub async fn receive(bus: Option<&str>, args: ReceiveArgs) -> Result<ExitCode, String> {
-    let (iface, name) = args.on.resolve().map_err(|e| e.to_string())?;
-    let announce = match Lease::find(bus, &iface.name).await {
-        Ok(lease) => lease.link.announce,
-        Err(e) => {
-            eprintln!("not announcing as the radio asks: {e}");
-            None
-        }
+    let (iface, name, _inproc_lease) = args.on.resolve().map_err(|e| e.to_string())?;
+    #[cfg(target_os = "linux")]
+    let burst_cfg = {
+        let announce = match Lease::find(bus, &iface.name).await {
+            Ok(lease) => lease.link.announce,
+            Err(e) => {
+                eprintln!("not announcing as the radio asks: {e}");
+                None
+            }
+        };
+        burst(announce)
     };
-    run_receiver(&iface, name, burst(announce), args)
+    #[cfg(windows)]
+    let burst_cfg = {
+        let _ = bus;
+        Some(mdns::Burst {
+            count: 3,
+            interval: Duration::from_millis(250),
+            pause: Duration::from_secs(3),
+        })
+    };
+    run_receiver(&iface, name, burst_cfg, args)
         .await
         .map_err(|e| e.to_string())
 }
@@ -142,15 +203,18 @@ pub async fn receive(bus: Option<&str>, args: ReceiveArgs) -> Result<ExitCode, S
 /// radio's AWDL peers (DISC-5), as `owly send` finds them.
 pub async fn browse(bus: Option<&str>, args: BrowseArgs) -> Result<ExitCode, String> {
     async {
-        let (iface, name) = args.on.resolve()?;
+        let (iface, name, inproc_lease) = args.on.resolve()?;
         let _advert = advertise(args.no_ble).await;
         let sender = Sender::new(sender::Config::new(name, random_service_id()?))?;
         let limit = Duration::from_secs(args.seconds);
         let deadline = tokio::time::Instant::now() + limit;
-        let lease = Lease::find(bus, &iface.name)
-            .await
-            .inspect_err(|e| eprintln!("not trying the radio's AWDL peers: {e}"))
-            .ok();
+        let lease = match inproc_lease {
+            Some(l) => Some(l),
+            None => Lease::find(bus, &iface.name)
+                .await
+                .inspect_err(|e| eprintln!("not trying the radio's AWDL peers: {e}"))
+                .ok(),
+        };
         let seen = std::cell::RefCell::new(std::collections::HashSet::new());
         let show = |r: &Listed| {
             if seen.borrow_mut().insert(r.addr) {
@@ -200,7 +264,7 @@ async fn send_inner(bus: Option<&str>, args: SendArgs) -> io::Result<ExitCode> {
         no_ble,
         files,
     } = args;
-    let (iface, name) = on.resolve()?;
+    let (iface, name, inproc_lease) = on.resolve()?;
     let payload = match (url.is_empty(), files.is_empty()) {
         (false, true) => Payload::Urls(url),
         (true, false) => Payload::Files(
@@ -229,10 +293,15 @@ async fn send_inner(bus: Option<&str>, args: SendArgs) -> io::Result<ExitCode> {
             }
         }
         None => {
-            let lease = Lease::find(bus, &iface.name)
-                .await
-                .inspect_err(|e| eprintln!("not trying the radio's AWDL peers: {e}"))
-                .ok();
+            let dbus_lease = if inproc_lease.is_none() {
+                Lease::find(bus, &iface.name)
+                    .await
+                    .inspect_err(|e| eprintln!("not trying the radio's AWDL peers: {e}"))
+                    .ok()
+            } else {
+                None
+            };
+            let lease = inproc_lease.as_ref().or(dbus_lease.as_ref());
             match &to {
                 Some(to) => eprintln!("looking for {to:?} for {seconds} s..."),
                 None => eprintln!("looking for a receiver for {seconds} s..."),
@@ -240,7 +309,7 @@ async fn send_inner(bus: Option<&str>, args: SendArgs) -> io::Result<ExitCode> {
             find_receiver(
                 &iface,
                 &sender,
-                lease.as_ref(),
+                lease,
                 to.as_deref(),
                 Duration::from_secs(seconds),
             )
@@ -286,6 +355,7 @@ struct Interface {
 
 impl Interface {
     /// The interface's index and IPv6 link-local address (NET-1, NET-2).
+    #[cfg(target_os = "linux")]
     fn lookup(name: &str) -> io::Result<Self> {
         let index = nix::net::if_::if_nametoindex(name)
             .map_err(|e| io::Error::other(format!("{name}: {e}")))?;
@@ -300,14 +370,26 @@ impl Interface {
             addr,
         })
     }
+
+    #[cfg(windows)]
+    fn lookup(name: &str) -> io::Result<Self> {
+        let (index, addr) = owly_radio::native::lookup_interface(name)?;
+        Ok(Interface {
+            name: name.into(),
+            index,
+            addr,
+        })
+    }
 }
 
 /// owlyd's lease on the interface we're on, when there's one.
+#[cfg(target_os = "linux")]
 struct Lease {
     radio: RadioProxy<'static>,
     link: LinkInfo,
 }
 
+#[cfg(target_os = "linux")]
 impl Lease {
     /// Why there's none when owlyd can't be reached, holds no lease, or
     /// leases another interface: on a link no Owly radio set up, such as
@@ -340,7 +422,35 @@ impl Lease {
     }
 }
 
+/// In-process Windows radio handle when `--pipe` is passed.
+#[cfg(windows)]
+struct Lease {
+    native: Option<Native>,
+    peers: tokio::sync::watch::Receiver<Vec<PeerInfo>>,
+}
+
+#[cfg(windows)]
+impl Lease {
+    async fn find(_bus: Option<&str>, _iface: &str) -> Result<Lease, String> {
+        Err("pass --pipe \\\\.\\pipe\\winawdl-radio for direct AWDL peer discovery".into())
+    }
+
+    async fn peers(&self) -> Vec<MacAddr> {
+        self.peers.borrow().iter().map(|p| p.mac).collect()
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Lease {
+    fn drop(&mut self) {
+        if let Some(native) = self.native.take() {
+            native.stop();
+        }
+    }
+}
+
 /// The burst the radio asks receivers to announce in (MDNS-7).
+#[cfg(target_os = "linux")]
 fn burst(announce: Option<Announce>) -> Option<mdns::Burst> {
     let a = announce?;
     eprintln!(
@@ -371,6 +481,7 @@ fn random_service_id() -> io::Result<String> {
 }
 
 /// BLE-5: a fresh tag per advert.
+#[cfg(target_os = "linux")]
 fn random_tag() -> io::Result<[u8; 3]> {
     let mut tag = [0; 3];
     getrandom::fill(&mut tag).map_err(|e| io::Error::other(e.to_string()))?;
@@ -384,6 +495,7 @@ fn parse_mac(text: &str) -> io::Result<MacAddr> {
 
 /// BLE-1: the advert that makes Apple receivers turn on AirDrop. Without
 /// Bluetooth, sending still works to receivers that are already listening.
+#[cfg(target_os = "linux")]
 async fn advertise(skip: bool) -> Option<Registration> {
     if skip {
         return None;
@@ -396,6 +508,20 @@ async fn advertise(skip: bool) -> Option<Registration> {
     }
     .await;
     match result {
+        Ok(guard) => Some(guard),
+        Err(e) => {
+            eprintln!("not advertising over Bluetooth: {e}");
+            None
+        }
+    }
+}
+
+#[cfg(windows)]
+async fn advertise(skip: bool) -> Option<WinBleAdvert> {
+    if skip {
+        return None;
+    }
+    match WinBleAdvert::start().await {
         Ok(guard) => Some(guard),
         Err(e) => {
             eprintln!("not advertising over Bluetooth: {e}");
@@ -651,19 +777,33 @@ async fn run_receiver(
         flags,
         ..
     } = args;
+    #[cfg(target_os = "linux")]
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
         .ok_or_else(|| io::Error::other("no XDG_STATE_HOME or HOME"))?
         .join("owly");
+    #[cfg(windows)]
+    let state = std::env::var_os("LOCALAPPDATA")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("owly");
     let identity = Identity::load_or_generate(&state)?;
     let mut config = Config::new(name.clone());
-    config.model_name = "Linux".into();
+    config.model_name = if cfg!(windows) {
+        "Windows".into()
+    } else {
+        "Linux".into()
+    };
     let addr = SocketAddrV6::new(iface.addr, port, 0, iface.index);
     let (receiver, mut events) = Receiver::bind(addr, &identity, Options::new(config, dir)).await?;
     tokio::spawn(receiver.run());
 
+    #[cfg(target_os = "linux")]
     let service_id = random_service_id()?;
+    #[cfg(windows)]
+    let service_id = mdns::service_id(crate::win_radio::DEFAULT_AWDL_MAC.0);
     let _registration = if no_mdns {
         None
     } else {
@@ -690,7 +830,11 @@ async fn run_receiver(
     loop {
         let event = tokio::select! {
             event = events.recv() => event,
-            _ = tokio::signal::ctrl_c() => return Ok(ExitCode::SUCCESS),
+            _ = tokio::signal::ctrl_c() => {
+                drop(_registration);
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                return Ok(ExitCode::SUCCESS);
+            }
         };
         let Some(event) = event else {
             return Ok(ExitCode::SUCCESS);

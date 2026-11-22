@@ -222,15 +222,21 @@ impl Rules {
         }
         let path = RelPath::parse(&entry.name)?;
         let unsupported = || Error::Unsupported(entry.name.clone());
-        // SEC-1: plain files and directories only. A file with other links is
-        // a hard link, whose data may be in another entry.
-        if !(entry.is_file() && entry.nlink <= 1 || entry.is_dir() && entry.size == 0) {
-            return Err(unsupported());
-        }
         let listed = self
             .allowed
             .iter()
             .any(|a| path == a.path && a.is_directory == entry.is_dir());
+        let is_sidecar = !listed && self.is_sidecar(&path);
+        // SEC-1: plain files and directories only. A file with other links is
+        // a hard link, whose data may be in another entry. AppleDouble `._*`
+        // sidecars (e.g. Live Photo `./._IMG_xxxx.pvt`) are never written to
+        // disk (`Item::Skip`), so skip them even if Apple's archive encodes
+        // them with non-zero directory size or special mode bits.
+        if !is_sidecar
+            && !(entry.is_file() && entry.nlink <= 1 || entry.is_dir() && entry.size == 0)
+        {
+            return Err(unsupported());
+        }
         let wrapped_file = self
             .allowed
             .iter()
@@ -242,7 +248,7 @@ impl Rules {
                     && a.path.components().len() == 2
                     && a.path.parent().as_ref() == Some(&path)
             });
-        let item = if wrapper || !listed && entry.is_file() && self.is_sidecar(&path) {
+        let item = if wrapper || is_sidecar {
             Item::Skip
         } else if wrapped_file && entry.is_file() {
             Item::File(RelPath::file_name(path.last())?)
