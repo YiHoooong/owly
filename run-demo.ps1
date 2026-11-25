@@ -185,6 +185,8 @@ if (-not $SkipRadio) {
 
 # 5. Build owly.exe arguments and run with full logs
 if (-not $env:RUST_LOG) { $env:RUST_LOG = 'info' }
+# Default to single-MPDU TX under MT7922 firmware RA (avoids A-MSDU tail stalls; set OWLY_NO_AMSDU=0 to override).
+if (-not $env:OWLY_NO_AMSDU) { $env:OWLY_NO_AMSDU = '1' }
 $owlyArgs = @()
 switch ($Mode) {
     'radio' {
