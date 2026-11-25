@@ -68,6 +68,12 @@ pub trait Netif {
     /// loses no packet, as with [`Air::recv`].
     fn recv(&mut self) -> impl Future<Output = io::Result<Ipv6Packet>>;
 
+    /// Non-blocking poll for additional queued outbound packets so bursts can
+    /// be enqueued together and aggregated into 2-subframe A-MSDUs.
+    fn try_recv(&mut self) -> Option<Ipv6Packet> {
+        None
+    }
+
     /// Hands the host a packet from a peer. One it can't take now is
     /// dropped, as a full queue would drop it.
     fn deliver(&mut self, packet: Ipv6Packet);
@@ -446,7 +452,22 @@ async fn run<A: Air, N: Netif>(mut d: Driver<A, N>) -> Result<(), String> {
             r = d.netif.recv(), if d.takes_outbound() => match r {
                 Ok(packet) => {
                     let now = d.now();
-                    d.handle(Input::Outbound { now, packet });
+                    let room = UNICAST_QUEUE
+                        .saturating_sub(d.node.backlog() + d.unicast.len() + 1)
+                        .min(31);
+                    let mut batch = Vec::new();
+                    for _ in 0..room {
+                        let Some(more) = d.netif.try_recv() else {
+                            break;
+                        };
+                        batch.push(more);
+                    }
+                    if batch.is_empty() {
+                        d.handle(Input::Outbound { now, packet });
+                    } else {
+                        batch.insert(0, packet);
+                        d.handle(Input::OutboundBatch { now, packets: batch });
+                    }
                 }
                 Err(e) => return Err(e.to_string()),
             },

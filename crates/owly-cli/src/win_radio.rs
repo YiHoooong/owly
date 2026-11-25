@@ -43,9 +43,12 @@ pub fn start_mtkradio(
     );
     let rate = select_tx_rate(ch_num);
     let amsdu = std::env::var("OWLY_NO_AMSDU")
-        .map(|v| v.trim() != "1")
-        .unwrap_or(true);
+        .map(|v| v.trim() == "0")
+        .unwrap_or(false);
     let no_ack = std::env::var("OWLY_NO_ACK")
+        .map(|v| v.trim() == "1")
+        .unwrap_or(false);
+    let continuous_tx = std::env::var("OWLY_CONTINUOUS_TX")
         .map(|v| v.trim() == "1")
         .unwrap_or(false);
     cfg.rate = rate;
@@ -53,13 +56,15 @@ pub fn start_mtkradio(
     cfg.accept_addba = true;
     cfg.initiate_addba = true;
     cfg.amsdu = amsdu;
-    cfg.max_frame = 4000;
+    cfg.continuous_tx = continuous_tx;
+    // Keep 2-subframe A-MSDUs safely below MT7922/VHT's 3,895-byte Max MPDU limit.
+    cfg.max_frame = 3200;
 
     let link_local = cfg.addr.link_local();
     let (peers_tx, peers_rx) = watch::channel(Vec::new());
     let native = Native::start_pipe(pipe, iface, cfg, peers_tx)?;
     eprintln!(
-        "[owly-win] {iface} up (ifindex={}, ip={link_local}, pipe={pipe}, ch={ch_num}, rate={rate}, no_ack={no_ack}, RX+TX-ADDBA, amsdu={amsdu})",
+        "[owly-win] {iface} up (ifindex={}, ip={link_local}, pipe={pipe}, ch={ch_num}, rate={rate}, no_ack={no_ack}, RX+TX-ADDBA, amsdu={amsdu}, cont_tx={continuous_tx})",
         native.index
     );
     Ok((native, peers_rx, link_local))

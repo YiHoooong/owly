@@ -36,6 +36,8 @@ pub enum Input<'a> {
     Timer(Time),
     /// A packet the IP stack wants sent.
     Outbound { now: Time, packet: Ipv6Packet },
+    /// A batch of packets the IP stack wants sent together (enables A-MSDU pairing).
+    OutboundBatch { now: Time, packets: Vec<Ipv6Packet> },
 }
 
 /// What a node asks of its host, in order.
@@ -127,6 +129,10 @@ pub struct Config {
     /// for radios whose firmware never sends group frames from an ad-hoc
     /// cell and resets when its queue stalls (Intel 8265).
     pub unicast_groups: bool,
+    /// Treat peer `0` (idle / home-AP) sequence slots as reachable on our own
+    /// channel so same-channel 5 GHz peers stream continuously at ~100% duty
+    /// cycle instead of pausing across non-social slots.
+    pub continuous_tx: bool,
 }
 
 impl Config {
@@ -147,6 +153,7 @@ impl Config {
             neighbour_echo: true,
             max_peers: MAX_PEERS,
             unicast_groups: false,
+            continuous_tx: false,
         }
     }
 }
@@ -287,6 +294,12 @@ impl Node {
             Input::Timer(now) => now,
             Input::Outbound { now, packet } => {
                 self.enqueue(now, packet, &mut out);
+                now
+            }
+            Input::OutboundBatch { now, packets } => {
+                for packet in packets {
+                    self.enqueue(now, packet, &mut out);
+                }
                 now
             }
         };
@@ -745,6 +758,9 @@ impl Node {
         let slot = self.clock.slot(t);
         let own = self.own_channel(slot);
         let theirs = peer.sequence.map_or(0, |s| s.channel(slot));
+        if self.cfg.continuous_tx && own != 0 {
+            return theirs == 0 || theirs == own;
+        }
         own != 0 && own == theirs
     }
 
@@ -838,8 +854,9 @@ impl Node {
             let peer_ht = self.peers[&dst].ht;
             let rate = self.cfg.rate.for_peer(peer_ht.as_ref());
             self.maybe_initiate_addba(now, dst, out);
+            let peer_tx_ba = self.peers[&dst].tx_ba_active;
             let mut batch = Vec::from([q]);
-            if self.cfg.amsdu && peer_ht.is_some() {
+            if self.cfg.amsdu && peer_ht.is_some() && peer_tx_ba {
                 let limit = peer_ht
                     .map_or(AMSDU_DEFAULT_MAX, |h| h.max_amsdu())
                     .min(self.cfg.max_frame.saturating_sub(frame::HEADER_LEN + 2));

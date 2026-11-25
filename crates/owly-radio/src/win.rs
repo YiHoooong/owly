@@ -1181,6 +1181,10 @@ impl Netif for WintunNetif {
             .ok_or_else(|| io::Error::other("wintun adapter closed"))
     }
 
+    fn try_recv(&mut self) -> Option<Ipv6Packet> {
+        self.rx.as_mut()?.try_recv().ok()
+    }
+
     fn deliver(&mut self, packet: Ipv6Packet) {
         let len = packet.data.len();
         if len == 0 || len > u32::MAX as usize {

@@ -211,7 +211,7 @@ if ($Direct) {
 
 # 5. Build owly.exe arguments and run with full logs
 if (-not $env:RUST_LOG) { $env:RUST_LOG = 'info' }
-# Default to single-MPDU TX under MT7922 firmware RA (avoids A-MSDU tail stalls; set OWLY_NO_AMSDU=0 to override).
+# Default to single-MPDU TX under MT7922 firmware RA (zero-loss 5.4 MB/s TX; set OWLY_NO_AMSDU=0 to test A-MSDU).
 if (-not $env:OWLY_NO_AMSDU) { $env:OWLY_NO_AMSDU = '1' }
 $owlyArgs = @()
 switch ($Mode) {
