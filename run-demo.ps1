@@ -43,6 +43,8 @@ param(
 
     [switch]$NoSystem,
 
+    [switch]$Direct,
+
     [switch]$Build
 )
 
@@ -100,10 +102,34 @@ if (-not (Get-NetFirewallRule -DisplayName $ruleName -ErrorAction SilentlyContin
     New-NetFirewallRule -DisplayName $ruleName -Direction Inbound -Action Allow -Program $owlyExe -Protocol Any | Out-Null
 }
 
-# 4. Locate and start mtkradio.exe (unless -SkipRadio)
+# 4. Locate and start mtkradio.exe (unless -SkipRadio or -Direct)
 $radioProc = $null
 $usedSystemTask = $false
-if (-not $SkipRadio) {
+$directDll = ''
+$directFwDir = ''
+if ($Direct) {
+    $dllCandidates = @(
+        (Join-Path $parent 'nekodrop\mtkradio\build\mtkradio_core.dll'),
+        (Join-Path $repo 'mtkradio_core.dll')
+    )
+    $directDll = $dllCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $directDll) { throw "mtkradio_core.dll not found under $parent" }
+    $fwCandidates = @(
+        (Join-Path (Split-Path $directDll -Parent) 'firmware'),
+        (Join-Path $parent 'nekodrop\mtkradio\firmware'),
+        (Join-Path $parent 'nekodrop-0.1.21-windows-x64\radio\firmware')
+    )
+    $directFwDir = $fwCandidates | Where-Object {
+        (Test-Path (Join-Path $_ 'WIFI_MT7922_patch_mcu_1_1_hdr.bin')) -and
+        (Test-Path (Join-Path $_ 'WIFI_RAM_CODE_MT7922_1.bin'))
+    } | Select-Object -First 1
+    if (-not $directFwDir) { throw "MT7922 firmware (.bin) files not found under $parent" }
+    Get-Process -Name mtkradio,owly -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    $pipe = 'direct'
+    $env:OWLY_MTKRADIO_DLL = $directDll
+    $env:OWLY_MTK_FW_DIR = $directFwDir
+    Write-Host "[demo] Single-process DIRECT mode: dll=$directDll fw=$directFwDir" -ForegroundColor Green
+} elseif (-not $SkipRadio) {
     $radioCandidates = @(
         (Join-Path $parent 'nekodrop\mtkradio\build\mtkradio.exe'),
         (Join-Path $parent 'nekodrop-0.1.21-windows-x64\radio\mtkradio.exe'),
@@ -216,16 +242,66 @@ switch ($Mode) {
 }
 
 Write-Host "[demo] Running: $owlyExe $($owlyArgs -join ' ')" -ForegroundColor Green
-try {
-    & $owlyExe @owlyArgs
-} finally {
-    if ($radioProc -and -not $radioProc.HasExited) {
-        Write-Host "[demo] Stopping mtkradio.exe (PID $($radioProc.Id))..." -ForegroundColor Yellow
-        Stop-Process -Id $radioProc.Id -Force -ErrorAction SilentlyContinue
-    }
-    if ($usedSystemTask) {
-        Write-Host "[demo] Stopping SYSTEM mtkradio.exe and cleaning up task '$taskName'..." -ForegroundColor Yellow
-        Get-Process -Name mtkradio -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+if ($Direct -and -not $NoSystem) {
+    $directLog = Join-Path $repo 'owly-direct.log'
+    $directCmd = Join-Path $repo 'run-owly-direct.cmd'
+    if (Test-Path $directLog) { Remove-Item $directLog -Force }
+    $quotedArgs = ($owlyArgs | ForEach-Object { if ($_ -match '\s') { "`"$_`"" } else { $_ } }) -join ' '
+    @(
+        '@echo off'
+        "set `"OWLY_WINTUN_DLL=$wintun`""
+        "set `"OWLY_MTKRADIO_DLL=$directDll`""
+        "set `"OWLY_MTK_FW_DIR=$directFwDir`""
+        "set `"OWLY_NO_AMSDU=$($env:OWLY_NO_AMSDU)`""
+        "set `"RUST_LOG=$($env:RUST_LOG)`""
+        if ($env:OWLY_BEACON_SCRIPT) { "set `"OWLY_BEACON_SCRIPT=$($env:OWLY_BEACON_SCRIPT)`"" }
+        "`"$owlyExe`" $quotedArgs > `"$directLog`" 2>&1"
+    ) | Set-Content -Path $directCmd -Encoding ASCII
+    schtasks /Create /F /RU SYSTEM /SC ONCE /ST 00:00 /TN $taskName /TR "cmd.exe /c `"$directCmd`"" | Out-Null
+    schtasks /Run /TN $taskName | Out-Null
+    $usedSystemTask = $true
+    Write-Host "[demo] Started single-process owly.exe as SYSTEM (log: $directLog)" -ForegroundColor Cyan
+    try {
+        # Wait briefly for owly.exe to spawn, then stream its log until it exits.
+        $waitSpawn = (Get-Date).AddSeconds(10)
+        while (-not (Get-Process -Name owly -ErrorAction SilentlyContinue) -and (Get-Date) -lt $waitSpawn) {
+            Start-Sleep -Milliseconds 100
+        }
+        $printed = 0
+        while ($true) {
+            if (Test-Path $directLog) {
+                $lines = @(Get-Content $directLog -ErrorAction SilentlyContinue)
+                if ($lines.Count -gt $printed) {
+                    $lines[$printed..($lines.Count - 1)] | ForEach-Object { Write-Host $_ }
+                    $printed = $lines.Count
+                }
+            }
+            if (-not (Get-Process -Name owly -ErrorAction SilentlyContinue)) { break }
+            Start-Sleep -Milliseconds 200
+        }
+        if (Test-Path $directLog) {
+            $lines = @(Get-Content $directLog -ErrorAction SilentlyContinue)
+            if ($lines.Count -gt $printed) {
+                $lines[$printed..($lines.Count - 1)] | ForEach-Object { Write-Host $_ }
+            }
+        }
+    } finally {
+        Write-Host "[demo] Stopping SYSTEM owly.exe and cleaning up task '$taskName'..." -ForegroundColor Yellow
+        Get-Process -Name owly -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
         schtasks /Delete /F /TN $taskName 2>$null | Out-Null
+    }
+} else {
+    try {
+        & $owlyExe @owlyArgs
+    } finally {
+        if ($radioProc -and -not $radioProc.HasExited) {
+            Write-Host "[demo] Stopping mtkradio.exe (PID $($radioProc.Id))..." -ForegroundColor Yellow
+            Stop-Process -Id $radioProc.Id -Force -ErrorAction SilentlyContinue
+        }
+        if ($usedSystemTask) {
+            Write-Host "[demo] Stopping SYSTEM mtkradio.exe and cleaning up task '$taskName'..." -ForegroundColor Yellow
+            Get-Process -Name mtkradio -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+            schtasks /Delete /F /TN $taskName 2>$null | Out-Null
+        }
     }
 }

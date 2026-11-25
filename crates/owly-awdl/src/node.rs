@@ -197,7 +197,7 @@ const SYN_HOLD_US: u64 = 2_000_000;
 /// Unicast packets waiting for their peer's slot at most. Beyond it the
 /// oldest is dropped, so a host should stop handing in packets while
 /// [`Node::backlog`] is this long, as legacy stopped reading `awdl0`.
-pub const UNICAST_QUEUE: usize = 128;
+pub const UNICAST_QUEUE: usize = 512;
 /// Multicast packets waiting at most, as many as legacy kept.
 const MULTICAST_QUEUE: usize = 16;
 const HELD_SYNS: usize = 128;
@@ -209,7 +209,7 @@ const HELD_SYNS: usize = 128;
 pub const MAX_PEERS: usize = 512;
 /// Frames sent for one input at most; the rest follow half a millisecond
 /// later, so the host's queue isn't flooded.
-const BURST: usize = 64;
+const BURST: usize = 256;
 const BURST_PAUSE_US: u64 = 500;
 /// The most packets in one A-MSDU.
 const AMSDU_PACKETS: usize = 8;

@@ -134,12 +134,24 @@ pub fn ask_request(config: &Config, transfer_id: &str, offer: &Offer) -> Vec<u8>
 
 /// The `/Upload` head for a body of `len` bytes (UP-1a, UP-9, UP-10).
 pub fn upload_head(transfer_id: &str, compressor: Compressor, len: u64) -> Vec<u8> {
+    upload_head_with_total(transfer_id, compressor, len, 0)
+}
+
+/// The `/Upload` head carrying the uncompressed `total_bytes` so iOS `sharingd`
+/// renders real-time transfer progress on the receiver screen.
+pub fn upload_head_with_total(
+    transfer_id: &str,
+    compressor: Compressor,
+    len: u64,
+    total_bytes: u64,
+) -> Vec<u8> {
     let len = len.to_string();
+    let total = total_bytes.to_string();
     head(
         Path::Upload,
         &[
             ("TransferID", transfer_id),
-            ("TotalBytes", "0"),
+            ("TotalBytes", &total),
             ("Content-Type", compressor.content_type()),
             ("Connection", "keep-alive"),
             ("Content-Length", &len),
@@ -321,6 +333,7 @@ pub struct Transfer {
     state: State,
     transfer_id: String,
     is_url: bool,
+    total_bytes: u64,
     upload: Option<(Compressor, u64)>,
     reader: ResponseReader,
     actions: VecDeque<Action>,
@@ -336,6 +349,10 @@ impl Transfer {
         upload: Option<(Compressor, u64)>,
     ) -> Self {
         let is_url = matches!(offer, Offer::Urls(_));
+        let total_bytes = match offer {
+            Offer::Files(files) => files.iter().map(|f| f.size.unwrap_or(0)).sum(),
+            Offer::Urls(_) => 0,
+        };
         let actions = VecDeque::from([
             Action::Transmit(ask_request(config, transfer_id, offer)),
             Action::SetTimer(Some(config.ask_timeout)),
@@ -344,6 +361,7 @@ impl Transfer {
             state: State::Asking,
             transfer_id: transfer_id.into(),
             is_url,
+            total_bytes,
             upload,
             reader: ResponseReader::new(),
             actions,
@@ -422,10 +440,11 @@ impl Transfer {
                 } else {
                     let (compressor, len) = self.upload.expect("a file share has an upload");
                     self.state = State::Uploading;
-                    self.actions.push_back(Action::SendUpload(upload_head(
+                    self.actions.push_back(Action::SendUpload(upload_head_with_total(
                         &self.transfer_id,
                         compressor,
                         len,
+                        self.total_bytes,
                     )));
                 }
             }

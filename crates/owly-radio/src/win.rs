@@ -7,13 +7,15 @@
 //! Wintun adapter configured with MTU 1450 and the AWDL MAC's EUI-64
 //! IPv6 link-local address without DAD (NET-1).
 
+use std::ffi::{CStr, CString, c_char, c_void};
 use std::io;
 use std::net::Ipv6Addr;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use owly_awdl::driver::{self, Air, Netif, Received, Running};
 use owly_awdl::frame::Frame;
@@ -36,9 +38,13 @@ use windows_sys::Win32::NetworkManagement::Ndis::NET_LUID_LH;
 use windows_sys::Win32::Networking::WinSock::{
     AF_INET6, IpDadStatePreferred, IpPrefixOriginManual, IpSuffixOriginManual,
 };
+use windows_sys::Win32::Security::{
+    AdjustTokenPrivileges, GetTokenInformation, LUID_AND_ATTRIBUTES, SE_PRIVILEGE_REMOVED,
+    TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY, TokenPrivileges,
+};
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, INFINITE, SetEvent, WaitForMultipleObjects,
+    CreateEventW, GetCurrentProcess, INFINITE, OpenProcessToken, SetEvent, WaitForMultipleObjects,
 };
 
 use crate::radiotap;
@@ -64,10 +70,10 @@ const PIPE_MAX_BODY: usize = 16 * 1024;
 const TX_QUEUE_CAP: usize = 1024;
 /// Maximum bytes combined into one batched Named Pipe `WriteFile` call.
 const TX_BATCH_MAX: usize = 128 * 1024;
-/// Wintun ring buffer capacity (4 MiB).
-const WINTUN_RING_CAPACITY: u32 = 0x40_0000;
+/// Wintun ring buffer capacity (8 MiB).
+const WINTUN_RING_CAPACITY: u32 = 0x80_0000;
 /// Bounded RX queue capacity between `wintun-rx` thread and `owly-awdl`.
-const WINTUN_RX_QUEUE_CAP: usize = 1024;
+const WINTUN_RX_QUEUE_CAP: usize = 4096;
 
 /// RAII guard that requests 1 ms Windows system timer resolution
 /// (`timeBeginPeriod(1)`) so `owly-awdl`'s timers don't suffer 15.6 ms jitter.
@@ -127,17 +133,40 @@ impl Native {
         let wintun = WintunAdapter::create(tap, link_local)?;
         let index = wintun.index;
         let mac = cfg.addr.0;
+        let ch = cfg.radio.channel.0;
         let pipe_path = pipe_path.to_string();
 
-        let running = driver::spawn(
-            cfg,
-            move || {
-                let air = PipeAir::connect(&pipe_path, mac)?;
-                let netif = WintunNetif::start(wintun)?;
-                Ok((air, netif))
-            },
-            peers,
-        )?;
+        let running = if pipe_path == "direct" || pipe_path.starts_with("direct:") {
+            let fw_dir = pipe_path
+                .strip_prefix("direct:")
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .or_else(|| std::env::var("OWLY_MTK_FW_DIR").ok())
+                .unwrap_or_else(|| {
+                    r"C:\Users\20662\Desktop\MTKAWDL\nekodrop\mtkradio\build\firmware".into()
+                });
+            let width_mhz: u32 = if ch <= 14 { 20 } else { 80 };
+            driver::spawn(
+                cfg,
+                move || {
+                    let air = DirectMtkAir::open(&fw_dir, ch, width_mhz, mac)?;
+                    let netif = WintunNetif::start(wintun)?;
+                    drop_process_privileges();
+                    Ok((air, netif))
+                },
+                peers,
+            )?
+        } else {
+            driver::spawn(
+                cfg,
+                move || {
+                    let air = PipeAir::connect(&pipe_path, mac)?;
+                    let netif = WintunNetif::start(wintun)?;
+                    Ok((air, netif))
+                },
+                peers,
+            )?
+        };
         Ok(Native {
             running,
             index,
@@ -412,6 +441,353 @@ impl Air for PipeAir {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => Err(frame),
             Err(mpsc::error::TrySendError::Closed(_)) => Ok(()),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Direct in-process MT7922 DMA Air (mtkradio_core.dll, zero Named Pipe IPC)
+// ---------------------------------------------------------------------------
+
+type MtkRxCallback = unsafe extern "C" fn(*const u8, usize, i8, *mut c_void);
+type MtkLogCallback = unsafe extern "C" fn(*const c_char, *mut c_void);
+
+type MtkOpenFn = unsafe extern "C" fn(
+    *const c_char,
+    u8,
+    u32,
+    *const u8,
+    *const u8,
+    i32,
+    Option<MtkLogCallback>,
+    *mut c_void,
+    *mut c_char,
+    usize,
+) -> *mut c_void;
+type MtkTransmitFn = unsafe extern "C" fn(
+    *mut c_void,
+    *const u8,
+    usize,
+    u8,
+    u8,
+    u8,
+    u8,
+    u8,
+    u8,
+    u8,
+) -> i32;
+type MtkKickTxFn = unsafe extern "C" fn(*mut c_void);
+type MtkPollFn = unsafe extern "C" fn(*mut c_void, Option<MtkRxCallback>, *mut c_void) -> usize;
+type MtkCloseFn = unsafe extern "C" fn(*mut c_void);
+
+struct MtkCoreDll {
+    module: HMODULE,
+    open: MtkOpenFn,
+    transmit: MtkTransmitFn,
+    kick_tx: MtkKickTxFn,
+    poll: MtkPollFn,
+    close: MtkCloseFn,
+}
+
+#[allow(unsafe_code)]
+// SAFETY: `MtkCoreDll` holds a loaded DLL handle and immutable function pointers
+// valid until `FreeLibrary` runs when dropped.
+unsafe impl Send for MtkCoreDll {}
+#[allow(unsafe_code)]
+unsafe impl Sync for MtkCoreDll {}
+
+impl Drop for MtkCoreDll {
+    fn drop(&mut self) {
+        if !self.module.is_null() {
+            #[allow(unsafe_code)]
+            unsafe {
+                FreeLibrary(self.module);
+            }
+        }
+    }
+}
+
+impl MtkCoreDll {
+    fn load() -> io::Result<Arc<Self>> {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(p) = std::env::var_os("OWLY_MTKRADIO_DLL") {
+            candidates.push(PathBuf::from(p));
+        }
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            candidates.push(dir.join("mtkradio_core.dll"));
+        }
+        candidates.push(PathBuf::from("mtkradio_core.dll"));
+        candidates.push(PathBuf::from(
+            r"..\nekodrop\mtkradio\build\mtkradio_core.dll",
+        ));
+        candidates.push(PathBuf::from(
+            r"C:\Users\20662\Desktop\MTKAWDL\nekodrop\mtkradio\build\mtkradio_core.dll",
+        ));
+
+        let mut module: HMODULE = ptr::null_mut();
+        for path in &candidates {
+            if path.is_absolute() && !path.exists() {
+                continue;
+            }
+            let wide = to_wide_os(path);
+            #[allow(unsafe_code)]
+            let h = unsafe { LoadLibraryW(wide.as_ptr()) };
+            if !h.is_null() {
+                tracing::info!("loaded mtkradio_core.dll from {}", path.display());
+                module = h;
+                break;
+            }
+        }
+        if module.is_null() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "could not load mtkradio_core.dll (set OWLY_MTKRADIO_DLL or place next to owly.exe)",
+            ));
+        }
+
+        macro_rules! load_sym {
+            ($name:literal, $ty:ty) => {{
+                #[allow(unsafe_code)]
+                let proc = unsafe { GetProcAddress(module, concat!($name, "\0").as_ptr()) };
+                let Some(f) = proc else {
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        FreeLibrary(module);
+                    }
+                    return Err(io::Error::other(concat!(
+                        "missing symbol in mtkradio_core.dll: ",
+                        $name
+                    )));
+                };
+                #[allow(unsafe_code)]
+                unsafe {
+                    std::mem::transmute::<unsafe extern "system" fn() -> isize, $ty>(f)
+                }
+            }};
+        }
+
+        Ok(Arc::new(Self {
+            module,
+            open: load_sym!("mtk_open", MtkOpenFn),
+            transmit: load_sym!("mtk_transmit", MtkTransmitFn),
+            kick_tx: load_sym!("mtk_kick_tx", MtkKickTxFn),
+            poll: load_sym!("mtk_poll", MtkPollFn),
+            close: load_sym!("mtk_close", MtkCloseFn),
+        }))
+    }
+}
+
+#[allow(unsafe_code)]
+unsafe extern "C" fn direct_mtk_log_cb(msg: *const c_char, _ctx: *mut c_void) {
+    if msg.is_null() {
+        return;
+    }
+    let s = unsafe { CStr::from_ptr(msg) }.to_string_lossy();
+    tracing::info!("[mtkradio-direct] {s}");
+}
+
+#[allow(unsafe_code)]
+unsafe extern "C" fn direct_mtk_rx_cb(
+    frame: *const u8,
+    len: usize,
+    rssi: i8,
+    ctx: *mut c_void,
+) {
+    if frame.is_null() || len < 16 || ctx.is_null() {
+        return;
+    }
+    let tx = unsafe { &*(ctx as *const mpsc::Sender<Received>) };
+    let slice = unsafe { std::slice::from_raw_parts(frame, len) };
+    let _ = tx.try_send(Received {
+        bytes: slice.to_vec(),
+        rssi: Some(rssi),
+    });
+}
+
+/// Direct single-process `Air` backed by `mtkradio_core.dll` (MT7922 32-bit DMA
+/// directly inside `owly.exe`, zero Named Pipe IPC and zero radiotap overhead).
+struct DirectMtkAir {
+    rx: mpsc::Receiver<Received>,
+    tx: std::sync::mpsc::SyncSender<Frame>,
+    stop: Arc<AtomicBool>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl DirectMtkAir {
+    fn open(fw_dir: &str, channel: u8, width_mhz: u32, own_mac: [u8; 6]) -> io::Result<Self> {
+        let dll = MtkCoreDll::load()?;
+        let fw_cstr = CString::new(fw_dir)
+            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid firmware path"))?;
+        let verbose = std::env::var("OWLY_MTK_VERBOSE")
+            .map(|v| v.trim() == "1")
+            .unwrap_or(true);
+
+        let (rx_tx, rx_rx) = mpsc::channel::<Received>(2048);
+        let (tx_tx, tx_rx) = std::sync::mpsc::sync_channel::<Frame>(2048);
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_bg = Arc::clone(&stop);
+
+        let worker = thread::Builder::new()
+            .name("mtk-dma".into())
+            .spawn(move || {
+                let mut err_buf = [0i8; 256];
+                #[allow(unsafe_code)]
+                let handle = unsafe {
+                    (dll.open)(
+                        fw_cstr.as_ptr(),
+                        channel,
+                        width_mhz,
+                        own_mac.as_ptr(),
+                        AWDL_BSSID.as_ptr(),
+                        if verbose { 1 } else { 0 },
+                        Some(direct_mtk_log_cb),
+                        ptr::null_mut(),
+                        err_buf.as_mut_ptr(),
+                        err_buf.len(),
+                    )
+                };
+                if handle.is_null() {
+                    #[allow(unsafe_code)]
+                    let msg = unsafe { CStr::from_ptr(err_buf.as_ptr()) }
+                        .to_string_lossy()
+                        .into_owned();
+                    let _ = ready_tx.send(Err(if msg.is_empty() {
+                        "mtk_open failed".into()
+                    } else {
+                        msg
+                    }));
+                    return;
+                }
+                let _ = ready_tx.send(Ok(()));
+
+                let mut last_active = Instant::now();
+                let spin_window = Duration::from_millis(5);
+                let rx_ctx = (&rx_tx as *const mpsc::Sender<Received>) as *mut c_void;
+                let mut pending_tx: Option<Frame> = None;
+
+                while !stop_bg.load(Ordering::Relaxed) {
+                    let mut tx_sent = 0usize;
+                    for _ in 0..256 {
+                        let frame = match pending_tx.take() {
+                            Some(f) => f,
+                            None => match tx_rx.try_recv() {
+                                Ok(f) => f,
+                                Err(_) => break,
+                            },
+                        };
+                        let (rate_mode, rate_val, nss, bw, sgi) = match frame.rate {
+                            TxRate::Legacy(r) => (0u8, (r / 2).max(6), 1u8, 0u8, 0u8),
+                            TxRate::Ht { mcs, sgi } => {
+                                (1u8, mcs, 1u8, 0u8, if sgi { 1 } else { 0 })
+                            }
+                            TxRate::Vht {
+                                mcs,
+                                nss,
+                                bw_mhz,
+                                sgi,
+                            } => {
+                                let bw_code = match bw_mhz {
+                                    80 => 2u8,
+                                    40 => 1u8,
+                                    _ => 0u8,
+                                };
+                                (2u8, mcs, nss, bw_code, if sgi { 1 } else { 0 })
+                            }
+                        };
+                        #[allow(unsafe_code)]
+                        let ok = unsafe {
+                            (dll.transmit)(
+                                handle,
+                                frame.bytes.as_ptr(),
+                                frame.bytes.len(),
+                                rate_mode,
+                                rate_val,
+                                nss,
+                                bw,
+                                sgi,
+                                if frame.no_ack { 1 } else { 0 },
+                                0, // batch kick below
+                            )
+                        };
+                        if ok != 0 {
+                            tx_sent += 1;
+                        } else {
+                            // Hardware TX DMA ring (256 slots) momentarily full: kick & retry next turn.
+                            pending_tx = Some(frame);
+                            break;
+                        }
+                    }
+                    if tx_sent > 0 {
+                        #[allow(unsafe_code)]
+                        unsafe {
+                            (dll.kick_tx)(handle);
+                        }
+                    }
+
+                    #[allow(unsafe_code)]
+                    let rx_got = unsafe { (dll.poll)(handle, Some(direct_mtk_rx_cb), rx_ctx) };
+
+                    if pending_tx.is_some() {
+                        thread::yield_now();
+                    } else if tx_sent > 0 || rx_got > 0 {
+                        last_active = Instant::now();
+                    } else if last_active.elapsed() < spin_window {
+                        thread::yield_now();
+                    } else {
+                        thread::sleep(Duration::from_millis(1));
+                    }
+                }
+
+                #[allow(unsafe_code)]
+                unsafe {
+                    (dll.close)(handle);
+                }
+            })?;
+
+        match ready_rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                rx: rx_rx,
+                tx: tx_tx,
+                stop,
+                worker: Some(worker),
+            }),
+            Ok(Err(msg)) => {
+                let _ = worker.join();
+                Err(io::Error::other(format!("mtkradio_core open failed: {msg}")))
+            }
+            Err(_) => {
+                let _ = worker.join();
+                Err(io::Error::other("mtk-dma thread exited during open"))
+            }
+        }
+    }
+}
+
+impl Drop for DirectMtkAir {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+impl Air for DirectMtkAir {
+    async fn recv(&mut self) -> io::Result<Received> {
+        self.rx
+            .recv()
+            .await
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "mtk-dma thread stopped"))
+    }
+
+    fn send(&mut self, frame: Frame) -> Result<(), Frame> {
+        match self.tx.try_send(frame) {
+            Ok(()) => Ok(()),
+            Err(std::sync::mpsc::TrySendError::Full(f)) => Err(f),
+            Err(std::sync::mpsc::TrySendError::Disconnected(_)) => Ok(()),
         }
     }
 }
@@ -694,7 +1070,7 @@ struct WintunNetif {
     adapter: SendHandle,
     session: SendHandle,
     stop_event: SendHandle,
-    rx: mpsc::Receiver<Ipv6Packet>,
+    rx: Option<mpsc::Receiver<Ipv6Packet>>,
     rx_thread: Option<JoinHandle<()>>,
 }
 
@@ -758,9 +1134,10 @@ impl WintunNetif {
                             (dll_rx.release_receive_packet)(session_h.0, ptr);
                         }
                         if let Some(pkt) = pkt {
-                            match tx.try_send(pkt) {
-                                Ok(()) | Err(mpsc::error::TrySendError::Full(_)) => {}
-                                Err(mpsc::error::TrySendError::Closed(_)) => break,
+                            // Apply lossless backpressure instead of silently dropping
+                            // outbound TCP bursts when `owly-awdl` pauses between slots.
+                            if tx.blocking_send(pkt).is_err() {
+                                break;
                             }
                         }
                         continue;
@@ -788,7 +1165,7 @@ impl WintunNetif {
             adapter,
             session: session_h,
             stop_event: stop_h,
-            rx,
+            rx: Some(rx),
             rx_thread: Some(rx_thread),
         })
     }
@@ -796,8 +1173,10 @@ impl WintunNetif {
 
 impl Netif for WintunNetif {
     async fn recv(&mut self) -> io::Result<Ipv6Packet> {
-        self.rx
-            .recv()
+        let Some(rx) = self.rx.as_mut() else {
+            return Err(io::Error::other("wintun adapter closed"));
+        };
+        rx.recv()
             .await
             .ok_or_else(|| io::Error::other("wintun adapter closed"))
     }
@@ -821,6 +1200,8 @@ impl Netif for WintunNetif {
 
 impl Drop for WintunNetif {
     fn drop(&mut self) {
+        // Close the receiver first so a blocked `tx.blocking_send` wakes immediately.
+        drop(self.rx.take());
         #[allow(unsafe_code)]
         // SAFETY: Signaling `stop_event` wakes `rx_thread` so it exits before
         // `end_session` and `close_adapter` run.
@@ -837,6 +1218,63 @@ impl Drop for WintunNetif {
             (self.dll.close_adapter)(self.adapter.0);
             CloseHandle(self.stop_event.0);
         }
+    }
+}
+
+/// Permanently removes (`SE_PRIVILEGE_REMOVED`) all privileges from the current
+/// process token once hardware DMA pages and Wintun have been initialized, so
+/// network/TLS processing runs without `SeDebugPrivilege`, `SeTcbPrivilege`,
+/// `SeLockMemoryPrivilege`, `SeTakeOwnershipPrivilege`, etc.
+fn drop_process_privileges() {
+    #[allow(unsafe_code)]
+    unsafe {
+        let mut token: HANDLE = ptr::null_mut();
+        if OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+            &mut token,
+        ) == 0
+            || token.is_null()
+        {
+            return;
+        }
+
+        let mut needed: u32 = 0;
+        let _ = GetTokenInformation(token, TokenPrivileges, ptr::null_mut(), 0, &mut needed);
+        if needed >= size_of::<TOKEN_PRIVILEGES>() as u32 {
+            let mut buf = vec![0u8; needed as usize];
+            if GetTokenInformation(
+                token,
+                TokenPrivileges,
+                buf.as_mut_ptr().cast(),
+                needed,
+                &mut needed,
+            ) != 0
+            {
+                let tp = &mut *(buf.as_mut_ptr() as *mut TOKEN_PRIVILEGES);
+                let count = tp.PrivilegeCount as usize;
+                let items = std::slice::from_raw_parts_mut(tp.Privileges.as_mut_ptr(), count);
+                for item in items.iter_mut() {
+                    item.Attributes = SE_PRIVILEGE_REMOVED;
+                }
+                let ok = AdjustTokenPrivileges(
+                    token,
+                    0,
+                    buf.as_ptr().cast(),
+                    needed,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                );
+                if ok != 0 {
+                    tracing::info!(
+                        "[security] permanently removed {} privileges (SE_PRIVILEGE_REMOVED) after hardware init",
+                        count
+                    );
+                }
+            }
+        }
+        let _ = std::mem::size_of::<LUID_AND_ATTRIBUTES>();
+        CloseHandle(token);
     }
 }
 

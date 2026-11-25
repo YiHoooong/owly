@@ -446,6 +446,13 @@ pub fn dvzip_chunk(piece: &[u8], level: Compression) -> Vec<u8> {
         out.reserve(out.capacity().max(64));
     }
     let len = (out.len() - 4) as u32;
+    if len as usize >= piece.len() && piece.len() < STORED as usize {
+        // DVZ-1 (as iOS sends JPEGs/APKs): store incompressible chunks verbatim.
+        out.truncate(4);
+        out[..4].copy_from_slice(&(piece.len() as u32 | STORED).to_be_bytes());
+        out.extend_from_slice(piece);
+        return out;
+    }
     out[..4].copy_from_slice(&len.to_be_bytes());
     out
 }

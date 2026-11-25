@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime};
 
 use flate2::Compression;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::net::{TcpSocket, TcpStream};
 use tokio::sync::mpsc;
 use tokio::time::{Instant, sleep_until, timeout};
 use tokio_rustls::TlsConnector;
@@ -78,7 +78,10 @@ impl Sender {
 
     async fn connect(&self, addr: SocketAddrV6) -> io::Result<TlsStream<TcpStream>> {
         tracing::info!("airdrop: TCP connecting to {addr}");
-        let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect(addr))
+        let sock = TcpSocket::new_v6()?;
+        let _ = sock.set_send_buffer_size(4 << 20);
+        let _ = sock.set_recv_buffer_size(4 << 20);
+        let stream = timeout(CONNECT_TIMEOUT, sock.connect(std::net::SocketAddr::V6(addr)))
             .await
             .map_err(|_| {
                 io::Error::new(
@@ -87,9 +90,6 @@ impl Sender {
                 )
             })??;
         stream.set_nodelay(true)?;
-        let sock = socket2::SockRef::from(&stream);
-        let _ = sock.set_send_buffer_size(2 << 20);
-        let _ = sock.set_recv_buffer_size(2 << 20);
         tracing::info!("airdrop: TCP connected to {addr}, starting TLS handshake");
         let tls = timeout(
             CONNECT_TIMEOUT,

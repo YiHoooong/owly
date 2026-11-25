@@ -12,7 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::AbortHandle;
 use tokio::time::{Instant, sleep_until, timeout};
@@ -188,7 +188,11 @@ impl Receiver {
         identity: &Identity,
         options: Options,
     ) -> io::Result<(Self, mpsc::Receiver<ReceiverEvent>)> {
-        let listener = TcpListener::bind(addr).await?;
+        let sock = TcpSocket::new_v6()?;
+        let _ = sock.set_recv_buffer_size(4 << 20);
+        let _ = sock.set_send_buffer_size(4 << 20);
+        sock.bind(std::net::SocketAddr::V6(addr))?;
+        let listener = sock.listen(128)?;
         let acceptor = TlsAcceptor::from(tls::server_config(identity)?);
         let (events, rx) = mpsc::channel(64);
         let config = Arc::new(options.config.clone());
@@ -284,8 +288,8 @@ impl Task {
     async fn run(self, stream: TcpStream, held: &Held) -> io::Result<()> {
         stream.set_nodelay(true)?;
         let sock = socket2::SockRef::from(&stream);
-        let _ = sock.set_recv_buffer_size(2 << 20);
-        let _ = sock.set_send_buffer_size(2 << 20);
+        let _ = sock.set_recv_buffer_size(4 << 20);
+        let _ = sock.set_send_buffer_size(4 << 20);
         let mut tls = timeout(HANDSHAKE_TIMEOUT, self.acceptor.accept(stream))
             .await
             .map_err(|_| io::Error::from(io::ErrorKind::TimedOut))??;
