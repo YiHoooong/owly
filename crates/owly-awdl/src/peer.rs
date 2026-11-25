@@ -1,11 +1,22 @@
 //! The peer table's entries: what each AWDL peer has said about itself.
 
 use alloc::string::String;
+use alloc::vec::Vec;
 
+use crate::ba_reorder::{BA_REORDER_TIDS, BaReorder};
 use crate::channel::Sequence;
 use crate::election::Election;
-use crate::tlv::{Advert, HtCapabilities};
+use crate::frame::Header;
+use crate::tlv::{Advert, HtCapabilities, VhtCapabilities};
 use crate::{MacAddr, Time};
+
+/// A buffered QoS Data frame held inside a peer's RX Block Ack reorder buffer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeldData {
+    pub header: Header,
+    pub amsdu: bool,
+    pub body: Vec<u8>,
+}
 
 /// An AWDL peer, as heard.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +35,9 @@ pub struct Peer {
     /// How far its AW schedule is ahead of ours, in µs.
     pub sync_offset_us: Option<i64>,
     pub ht: Option<HtCapabilities>,
+    pub vht: Option<VhtCapabilities>,
+    /// Whether the peer advertised Apple AWDL Wi-Fi 6 (HE) support in TLV 12.
+    pub he: bool,
     /// Its station address on its infrastructure network.
     pub infra: Option<MacAddr>,
     /// Whether it has sent a MIF.
@@ -40,6 +54,8 @@ pub struct Peer {
     pub(crate) tx_ba_last_req: Option<Time>,
     /// Next ADDBA Request dialog token for this peer.
     pub(crate) tx_ba_token: u8,
+    /// Active 802.11 RX Block Ack reorder buffers indexed by QoS TID (`0..8`).
+    pub(crate) rx_ba: [Option<BaReorder<HeldData>>; BA_REORDER_TIDS],
 }
 
 /// What a host is told about a peer that has turned valid.
@@ -64,6 +80,8 @@ impl Peer {
             sequence: None,
             sync_offset_us: None,
             ht: None,
+            vht: None,
+            he: false,
             infra: None,
             mif: false,
             v2: false,
@@ -71,6 +89,7 @@ impl Peer {
             tx_ba_active: false,
             tx_ba_last_req: None,
             tx_ba_token: 0,
+            rx_ba: [const { None }; BA_REORDER_TIDS],
         }
     }
 
@@ -100,8 +119,14 @@ impl Peer {
         if let Some(ht) = a.ht {
             self.ht = Some(ht);
         }
-        if let Some(infra) = a.data_path.and_then(|d| d.infra) {
-            self.infra = Some(infra);
+        if let Some(vht) = a.vht {
+            self.vht = Some(vht);
+        }
+        if let Some(dp) = a.data_path {
+            if let Some(infra) = dp.infra {
+                self.infra = Some(infra);
+            }
+            self.he = dp.he;
         }
         if let Some(e) = a.election
             && (a.election_v2 || !self.v2)

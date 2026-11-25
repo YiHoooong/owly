@@ -150,8 +150,12 @@ impl On {
             None => std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows".into()),
         };
         if let Some(pipe) = &self.pipe {
+            // Match ARPA host label to the deterministic AirDrop mDNS service ID
+            // (`<service_id>.local`) so iOS mDNSResponder/sharingd sees one unified
+            // host/service identity on `awdl0` (matching luobodrop & Apple devices).
+            let arpa_host = mdns::service_id(crate::win_radio::DEFAULT_AWDL_MAC.0);
             let (native, peers, addr) =
-                crate::win_radio::start_mtkradio(pipe, &self.iface, self.channel, &name)?;
+                crate::win_radio::start_mtkradio(pipe, &self.iface, self.channel, &arpa_host)?;
             let iface = Interface {
                 name: self.iface.clone(),
                 index: native.index,
@@ -801,15 +805,22 @@ async fn run_receiver(
     tokio::spawn(receiver.run());
 
     #[cfg(target_os = "linux")]
-    let service_id = random_service_id()?;
+    let (service_id, mdns_host) = {
+        let id = random_service_id()?;
+        let host = format!("owly-{id}");
+        (id, host)
+    };
     #[cfg(windows)]
-    let service_id = mdns::service_id(crate::win_radio::DEFAULT_AWDL_MAC.0);
+    let (service_id, mdns_host) = {
+        let id = mdns::service_id(crate::win_radio::DEFAULT_AWDL_MAC.0);
+        (id.clone(), id)
+    };
     let _registration = if no_mdns {
         None
     } else {
         let service = Service {
             instance: service_id.clone(),
-            host: format!("owly-{service_id}"),
+            host: mdns_host,
             port,
             addr: iface.addr,
             flags,

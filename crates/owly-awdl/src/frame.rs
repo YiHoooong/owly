@@ -35,11 +35,13 @@ impl Frame {
 /// Frame control values, type and subtype.
 pub mod fc {
     pub const ACTION: u16 = 0x00d0;
+    pub const BLOCK_ACK_REQ: u16 = 0x0084;
     pub const DATA: u16 = 0x0008;
     pub const QOS_DATA: u16 = 0x0088;
     pub const TYPE_SUBTYPE: u16 = 0x00fc;
     pub const TYPE: u16 = 0x000c;
     pub const TYPE_MANAGEMENT: u16 = 0x0000;
+    pub const TYPE_CONTROL: u16 = 0x0004;
     pub const TYPE_DATA: u16 = 0x0008;
     pub const TO_DS: u16 = 0x0100;
     pub const FROM_DS: u16 = 0x0200;
@@ -64,10 +66,11 @@ const CATEGORY_VENDOR: u8 = 127;
 const AWDL_TYPE: u8 = 8;
 /// AWDL 1.0, major in the high nibble: what the action header carries.
 const AWDL_VERSION_COMPAT: u8 = 0x10;
-/// The Block Ack action category, and its ADDBA request and response.
+/// The Block Ack action category, and its ADDBA/DELBA action codes.
 const CATEGORY_BLOCK_ACK: u8 = 3;
 const ADDBA_REQUEST: u8 = 0;
 const ADDBA_RESPONSE: u8 = 1;
+const DELBA: u8 = 2;
 
 /// The SNAP header AWDL data frames carry (AWDL-13).
 const LLC_SNAP: [u8; 8] = [0xaa, 0xaa, 0x03, OUI[0], OUI[1], OUI[2], 0x08, 0x00];
@@ -112,6 +115,7 @@ pub enum Received<'a> {
         token: u8,
         params: u16,
         timeout: u16,
+        start_seq: u16,
     },
     /// A peer's response to our ADDBA Request.
     AddBaResponse {
@@ -119,6 +123,20 @@ pub enum Received<'a> {
         token: u8,
         status: u16,
         params: u16,
+    },
+    /// A DELBA tearing down a Block Ack session.
+    DelBa {
+        header: Header,
+        tid: u8,
+        initiator: bool,
+        reason: u16,
+    },
+    /// A Control BlockAckReq advancing a Block Ack receive window.
+    BlockAckReq {
+        dst: MacAddr,
+        src: MacAddr,
+        tid: u8,
+        start_seq: u16,
     },
     /// An AWDL data frame: one MSDU, or an A-MSDU.
     Data {
@@ -128,6 +146,16 @@ pub enum Received<'a> {
     },
     /// Anything else on the air.
     Other,
+}
+
+/// Returns the 4-bit QoS TID for a QoS Data frame, or `None` for non-QoS frames.
+pub fn qos_tid(bytes: &[u8]) -> Option<u8> {
+    let b = Bytes(bytes);
+    let fc_val = b.le16(0).ok()?;
+    if fc_val & fc::TYPE_SUBTYPE != fc::QOS_DATA {
+        return None;
+    }
+    Some((b.le16(HEADER_LEN).ok()? & 0x000f) as u8)
 }
 
 /// A frame's three-address MAC header, if it has one.
@@ -148,7 +176,27 @@ pub fn parse(bytes: &[u8]) -> Result<Received<'_>, Error> {
     // Control frames (ACK, RTS, CTS, Block Ack) and extension frames have
     // no three-address header, and a monitor hears plenty of them: they're
     // not AWDL, not malformed.
-    let t = b.le16(0)? & fc::TYPE;
+    let fc_val = b.le16(0)?;
+    let t = fc_val & fc::TYPE;
+    if t == fc::TYPE_CONTROL {
+        // Basic / Compressed BlockAckReq (20 bytes): FC(2) + Dur(2) + RA(6) + TA(6) + BAR Ctrl(2) + SSC(2).
+        if fc_val & fc::TYPE_SUBTYPE == fc::BLOCK_ACK_REQ
+            && fc_val & fc::PROTECTED == 0
+            && bytes.len() >= 20
+        {
+            let ctrl = b.le16(16)?;
+            // Reject Multi-TID BAR (bit 1 set); accept Basic (0x0000) and Compressed (0x0004).
+            if ctrl & 0x0002 == 0 {
+                return Ok(Received::BlockAckReq {
+                    dst: b.mac(4)?,
+                    src: b.mac(10)?,
+                    tid: (ctrl >> 12) as u8,
+                    start_seq: b.le16(18)? >> 4,
+                });
+            }
+        }
+        return Ok(Received::Other);
+    }
     if t != fc::TYPE_MANAGEMENT && t != fc::TYPE_DATA {
         return Ok(Received::Other);
     }
@@ -197,6 +245,7 @@ fn action(header: Header, body: &[u8]) -> Result<Received<'_>, Error> {
             token: b.u8(2)?,
             params: b.le16(3)?,
             timeout: b.le16(5)?,
+            start_seq: b.le16(7)? >> 4,
         });
     }
     if b.u8(0)? == CATEGORY_BLOCK_ACK && b.u8(1)? == ADDBA_RESPONSE {
@@ -205,6 +254,15 @@ fn action(header: Header, body: &[u8]) -> Result<Received<'_>, Error> {
             token: b.u8(2)?,
             status: b.le16(3)?,
             params: b.le16(5)?,
+        });
+    }
+    if b.u8(0)? == CATEGORY_BLOCK_ACK && b.u8(1)? == DELBA {
+        let params = b.le16(2)?;
+        return Ok(Received::DelBa {
+            header,
+            tid: (params >> 12) as u8,
+            initiator: params & 0x0800 != 0,
+            reason: b.le16(4)?,
         });
     }
     if body.len() < ACTION_HEADER_LEN
@@ -345,7 +403,13 @@ pub fn amsdu_frame(
     awdl_seq: u16,
     packets: &[&[u8]],
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(2048);
+    let cap = HEADER_LEN
+        + 2
+        + packets
+            .iter()
+            .map(|p| amsdu_subframe_len(p.len()) + 3)
+            .sum::<usize>();
+    let mut out = Vec::with_capacity(cap);
     put_header(&mut out, fc::QOS_DATA, dst, src, seq);
     out.le16(0x0080); // QoS control: A-MSDU present
     for (i, p) in packets.iter().enumerate() {
@@ -414,11 +478,28 @@ pub fn addba_response(
     requested: u16,
     timeout: u16,
 ) -> Vec<u8> {
+    addba_response_with_amsdu(src, dst, seq, token, requested, timeout, false)
+}
+
+/// An ADDBA response accepting a request (status 0, immediate Block Ack,
+/// window clamped to `1..=64`). When `allow_amsdu` is true, bit 0
+/// (A-MSDU Supported) is echoed from `requested` so peers can aggregate
+/// A-MSDUs inside A-MPDUs.
+pub fn addba_response_with_amsdu(
+    src: MacAddr,
+    dst: MacAddr,
+    seq: u16,
+    token: u8,
+    requested: u16,
+    timeout: u16,
+    allow_amsdu: bool,
+) -> Vec<u8> {
     let mut window = (requested >> 6) & 0x3ff;
     if window == 0 || window > 64 {
         window = 64;
     }
-    let params = (requested & 0x003c) | 0x0002 | (window << 6);
+    let amsdu_bit = if allow_amsdu { requested & 0x0001 } else { 0 };
+    let params = (requested & 0x003c) | 0x0002 | amsdu_bit | (window << 6);
     let mut out = Vec::with_capacity(HEADER_LEN + 9);
     put_header(&mut out, fc::ACTION, dst, src, seq);
     out.u8(CATEGORY_BLOCK_ACK);
@@ -427,6 +508,39 @@ pub fn addba_response(
     out.le16(0); // success
     out.le16(params);
     out.le16(timeout);
+    out
+}
+
+/// An 802.11 DELBA action frame (Category 3, Action 2).
+pub fn delba(
+    src: MacAddr,
+    dst: MacAddr,
+    seq: u16,
+    tid: u8,
+    initiator: bool,
+    reason: u16,
+) -> Vec<u8> {
+    let params = ((tid as u16 & 0x0f) << 12) | if initiator { 0x0800 } else { 0 };
+    let mut out = Vec::with_capacity(HEADER_LEN + 6);
+    put_header(&mut out, fc::ACTION, dst, src, seq);
+    out.u8(CATEGORY_BLOCK_ACK);
+    out.u8(DELBA);
+    out.le16(params);
+    out.le16(reason);
+    out
+}
+
+/// An 802.11 Compressed BlockAckReq (BAR) control frame (20 bytes).
+pub fn block_ack_req(src: MacAddr, dst: MacAddr, tid: u8, start_seq: u16) -> Vec<u8> {
+    let ctrl = ((tid as u16 & 0x0f) << 12) | 0x0004; // Compressed BAR
+    let ssc = (start_seq & 0x0fff) << 4;
+    let mut out = Vec::with_capacity(20);
+    out.le16(fc::BLOCK_ACK_REQ);
+    out.le16(0); // duration
+    out.mac(dst);
+    out.mac(src);
+    out.le16(ctrl);
+    out.le16(ssc);
     out
 }
 
@@ -619,16 +733,125 @@ mod tests {
             token,
             params,
             timeout,
+            start_seq,
         } = parse(&req).unwrap()
         else {
             panic!("not ADDBA");
         };
-        assert_eq!((header.src, token, timeout), (B, 9, 0));
+        assert_eq!((header.src, token, timeout, start_seq), (B, 9, 0, 0));
         let resp = addba_response(A, B, 4, token, params, timeout);
         let body = &resp[HEADER_LEN..];
         assert_eq!(&body[..5], &[3, 1, 9, 0, 0]);
         let p = u16::from_le_bytes([body[5], body[6]]);
         assert_eq!(((p >> 2) & 0xf, p & 0x3, p >> 6), (5, 0x2, 64));
         assert_eq!(&resp[4..10], &B.0);
+    }
+
+    #[test]
+    fn bar_and_delba_roundtrip() {
+        let bar = block_ack_req(B, A, 3, 4095);
+        assert_eq!(bar.len(), 20);
+        assert_eq!(
+            parse(&bar),
+            Ok(Received::BlockAckReq {
+                dst: A,
+                src: B,
+                tid: 3,
+                start_seq: 4095,
+            })
+        );
+
+        let d = delba(B, A, 7, 0, true, 39);
+        match parse(&d).unwrap() {
+            Received::DelBa {
+                header,
+                tid,
+                initiator,
+                reason,
+            } => {
+                assert_eq!((header.src, header.dst, header.seq), (B, A, 7));
+                assert_eq!((tid, initiator, reason), (0, true, 39));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn mtu_1500_two_subframe_amsdu_roundtrip() {
+        let mut p1 = vec![0u8; 1500];
+        let mut p2 = vec![0u8; 1500];
+        p1[0] = 0x60;
+        p1[1499] = 0xaa;
+        p2[0] = 0x60;
+        p2[1499] = 0x55;
+        let frame = amsdu_frame(A, B, 0x321, 40, &[&p1, &p2]);
+        // 24 MAC + 2 QoS + (14+16+1500 = 1530, padded to 1532) + (14+16+1500 = 1530) = 3088 B
+        assert_eq!(frame.len(), 3088);
+        assert!(frame.len() <= 3800);
+        assert_eq!(qos_tid(&frame), Some(0));
+        let Received::Data {
+            header,
+            amsdu,
+            body,
+        } = parse(&frame).unwrap()
+        else {
+            panic!("not data");
+        };
+        assert!(amsdu);
+        assert_eq!(header.seq, 0x321);
+        let unpacked = msdus(&header, amsdu, body).unwrap();
+        assert_eq!(unpacked.len(), 2);
+        assert_eq!(unpacked[0].payload, p1.as_slice());
+        assert_eq!(unpacked[1].payload, p2.as_slice());
+    }
+
+    #[test]
+    fn addba_response_echoes_amsdu_permitted_and_unpacks_large_rx_amsdu() {
+        // Requested TID 0, win 64, immediate BA, amsdu=1.
+        let req_amsdu: u16 = (64 << 6) | 0x0003;
+        let resp_on = addba_response_with_amsdu(A, B, 5, 11, req_amsdu, 0, true);
+        let p_on = u16::from_le_bytes([resp_on[HEADER_LEN + 5], resp_on[HEADER_LEN + 6]]);
+        assert_eq!(((p_on >> 2) & 0xf, p_on & 0x3, p_on >> 6), (0, 0x3, 64));
+
+        // Peer did not request amsdu=1: must remain 0 even when allow_amsdu=true.
+        let req_no_amsdu: u16 = (64 << 6) | 0x0002;
+        let resp_echo_off = addba_response_with_amsdu(A, B, 6, 12, req_no_amsdu, 0, true);
+        let p_echo = u16::from_le_bytes([
+            resp_echo_off[HEADER_LEN + 5],
+            resp_echo_off[HEADER_LEN + 6],
+        ]);
+        assert_eq!(p_echo & 0x3, 0x2);
+
+        // allow_amsdu=false forces bit 0 to 0 even when requested.
+        let resp_off = addba_response_with_amsdu(A, B, 7, 13, req_amsdu, 0, false);
+        let p_off = u16::from_le_bytes([resp_off[HEADER_LEN + 5], resp_off[HEADER_LEN + 6]]);
+        assert_eq!(p_off & 0x3, 0x2);
+
+        // 5-subframe x 1500B RX A-MSDU (~7.7 KiB, up to ~8 KiB) decodes cleanly without truncation.
+        let pkts: Vec<Vec<u8>> = (0u8..5)
+            .map(|i| {
+                let mut v = vec![i; 1500];
+                v[0] = 0x60;
+                v[1499] = i.wrapping_add(0xa0);
+                v
+            })
+            .collect();
+        let refs: Vec<&[u8]> = pkts.iter().map(Vec::as_slice).collect();
+        let big = amsdu_frame(B, A, 0x555, 100, &refs);
+        assert!(big.len() > 7500 && big.len() < 8192, "len={}", big.len());
+        let Received::Data {
+            header,
+            amsdu,
+            body,
+        } = parse(&big).unwrap()
+        else {
+            panic!("not data");
+        };
+        assert!(amsdu);
+        let out = msdus(&header, amsdu, body).unwrap();
+        assert_eq!(out.len(), 5);
+        for (i, m) in out.iter().enumerate() {
+            assert_eq!(m.payload, pkts[i].as_slice());
+        }
     }
 }

@@ -32,6 +32,10 @@ impl Air for MemAir {
             .ok_or_else(|| io::Error::other("the other end went"))
     }
 
+    fn try_recv(&mut self) -> Option<Received> {
+        self.rx.try_recv().ok()
+    }
+
     fn send(&mut self, frame: Frame) -> Result<(), Frame> {
         if self.full.load(Ordering::Relaxed) {
             return Err(frame);
@@ -53,6 +57,8 @@ struct MemNetif {
     up: watch::Sender<Vec<MacAddr>>,
     /// Packets the node has taken from the host.
     read: Arc<AtomicUsize>,
+    /// Number of `flush_inbound` calls observed.
+    flushes: Arc<AtomicUsize>,
 }
 
 impl Netif for MemNetif {
@@ -70,6 +76,10 @@ impl Netif for MemNetif {
         let _ = self.delivered.send(packet);
     }
 
+    fn flush_inbound(&mut self) {
+        self.flushes.fetch_add(1, Ordering::Relaxed);
+    }
+
     fn peer_up(&mut self, mac: MacAddr) {
         self.up.send_modify(|up| up.push(mac));
     }
@@ -84,6 +94,7 @@ struct Host {
     sent: Arc<AtomicUsize>,
     full: Arc<AtomicBool>,
     read: Arc<AtomicUsize>,
+    flushes: Arc<AtomicUsize>,
 }
 
 fn mac(n: u8) -> MacAddr {
@@ -114,6 +125,7 @@ fn host_with(
     let sent = Arc::new(AtomicUsize::new(0));
     let full = Arc::new(AtomicBool::new(false));
     let read = Arc::new(AtomicUsize::new(0));
+    let flushes = Arc::new(AtomicUsize::new(0));
     let air = MemAir {
         tx,
         rx,
@@ -121,6 +133,7 @@ fn host_with(
         full: full.clone(),
     };
     let netif_read = read.clone();
+    let netif_flushes = flushes.clone();
     let running = driver::spawn(
         cfg,
         move || {
@@ -129,6 +142,7 @@ fn host_with(
                 delivered: delivered_tx,
                 up: up_tx,
                 read: netif_read,
+                flushes: netif_flushes,
             };
             Ok((air, netif))
         },
@@ -144,6 +158,7 @@ fn host_with(
         sent,
         full,
         read,
+        flushes,
     }
 }
 
@@ -332,6 +347,7 @@ async fn the_host_is_not_read_while_the_queue_is_full() {
     a.full.store(false, Ordering::Relaxed);
     let got = received(&mut b, 1000, Duration::from_secs(5)).await;
     assert_eq!(got, (0..1000).collect::<Vec<_>>());
+    assert!(b.flushes.load(Ordering::Relaxed) > 0, "flush_inbound called");
     a.running.stop();
     b.running.stop();
 }

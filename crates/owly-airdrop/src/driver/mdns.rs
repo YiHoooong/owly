@@ -91,11 +91,18 @@ impl Mdns {
         SocketAddrV6::new(MDNS_GROUP, MDNS_PORT, 0, self.scope_id)
     }
 
-    /// Only packets from this interface count; with several interfaces
-    /// joined, others arrive on the same socket.
+    /// Only link-local packets from this interface count; on Windows a socket
+    /// bound to `[::]:5353` also receives LAN/VPN queries whose global/ULA
+    /// source addresses have `scope_id == 0`, and answering those leaks
+    /// `_airdrop._tcp.local` onto Ethernet/Wi-Fi LAN causing duplicate AirDrop
+    /// icons on iOS.
     fn on_this_link(&self, from: SocketAddr) -> Option<SocketAddrV6> {
         match from {
-            SocketAddr::V6(from) if from.scope_id() == self.scope_id || from.scope_id() == 0 => {
+            SocketAddr::V6(from)
+                if self.scope_id != 0
+                    && from.scope_id() == self.scope_id
+                    && (from.ip().segments()[0] & 0xffc0 == 0xfe80) =>
+            {
                 Some(from)
             }
             _ => None,
@@ -174,5 +181,54 @@ impl Mdns {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    #[test]
+    fn on_this_link_accepts_only_link_local_on_bound_scope() {
+        let mdns = Mdns::new(2);
+        let awdl_peer = SocketAddr::V6(SocketAddrV6::new(
+            "fe80::24:30ff:fe57:cacf".parse().unwrap(),
+            5353,
+            0,
+            2,
+        ));
+        assert_eq!(mdns.on_this_link(awdl_peer).map(SocketAddr::V6), Some(awdl_peer));
+
+        // Rejects another interface's link-local (e.g. Ethernet LAN ifIndex 5).
+        let lan_ll = SocketAddr::V6(SocketAddrV6::new(
+            "fe80::24:30ff:fe57:cacf".parse().unwrap(),
+            5353,
+            0,
+            5,
+        ));
+        assert_eq!(mdns.on_this_link(lan_ll), None);
+
+        // Rejects global/ULA IPv6 with scope_id == 0 (prevents LAN mDNS leak).
+        let lan_global = SocketAddr::V6(SocketAddrV6::new(
+            "2001:db8::1".parse().unwrap(),
+            5353,
+            0,
+            0,
+        ));
+        assert_eq!(mdns.on_this_link(lan_global), None);
+
+        // Rejects link-local with missing scope_id == 0.
+        let ll_no_scope = SocketAddr::V6(SocketAddrV6::new(
+            "fe80::1".parse().unwrap(),
+            5353,
+            0,
+            0,
+        ));
+        assert_eq!(mdns.on_this_link(ll_no_scope), None);
+
+        // Rejects IPv4.
+        let v4 = SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 5353));
+        assert_eq!(mdns.on_this_link(v4), None);
     }
 }

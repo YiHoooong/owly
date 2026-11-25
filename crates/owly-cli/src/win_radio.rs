@@ -42,29 +42,41 @@ pub fn start_mtkradio(
         },
     );
     let rate = select_tx_rate(ch_num);
+    let mtu = owly_radio::native::configured_mtu();
+    let gro = owly_radio::native::gro_enabled();
     let amsdu = std::env::var("OWLY_NO_AMSDU")
-        .map(|v| v.trim() == "0")
-        .unwrap_or(false);
+        .map(|v| v.trim() != "1")
+        .unwrap_or(true);
+    let rx_amsdu = std::env::var("OWLY_NO_RX_AMSDU")
+        .map(|v| v.trim() != "1")
+        .unwrap_or(true);
     let no_ack = std::env::var("OWLY_NO_ACK")
         .map(|v| v.trim() == "1")
         .unwrap_or(false);
     let continuous_tx = std::env::var("OWLY_CONTINUOUS_TX")
         .map(|v| v.trim() == "1")
         .unwrap_or(false);
+    let he = std::env::var("OWLY_NO_HE")
+        .map(|v| v.trim() != "1")
+        .unwrap_or(ch_num > 14);
     cfg.rate = rate;
     cfg.no_ack = no_ack;
     cfg.accept_addba = true;
     cfg.initiate_addba = true;
     cfg.amsdu = amsdu;
+    cfg.rx_amsdu = rx_amsdu;
     cfg.continuous_tx = continuous_tx;
-    // Keep 2-subframe A-MSDUs safely below MT7922/VHT's 3,895-byte Max MPDU limit.
-    cfg.max_frame = 3200;
+    cfg.he = he;
+    cfg.mtu = mtu as u16;
+    // Keep 2-subframe A-MSDUs (2x1500B = 3088B) safely below MT7922/VHT's 3,895-byte Max MPDU
+    // and 4,096-byte DMA page limit.
+    cfg.max_frame = 3800.max(mtu as usize + 64);
 
     let link_local = cfg.addr.link_local();
     let (peers_tx, peers_rx) = watch::channel(Vec::new());
     let native = Native::start_pipe(pipe, iface, cfg, peers_tx)?;
     eprintln!(
-        "[owly-win] {iface} up (ifindex={}, ip={link_local}, pipe={pipe}, ch={ch_num}, rate={rate}, no_ack={no_ack}, RX+TX-ADDBA, amsdu={amsdu}, cont_tx={continuous_tx})",
+        "[owly-win] {iface} up (ifindex={}, ip={link_local}, pipe={pipe}, ch={ch_num}, mtu={mtu}, gro={gro}, he={he}, rate={rate}, no_ack={no_ack}, RX+TX-ADDBA, amsdu={amsdu}, rx_amsdu={rx_amsdu}, cont_tx={continuous_tx})",
         native.index
     );
     Ok((native, peers_rx, link_local))

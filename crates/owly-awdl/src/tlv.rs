@@ -280,19 +280,28 @@ pub struct DataPathState {
     pub country: Option<[u8; 3]>,
     /// The sender's station address on its infrastructure network.
     pub infra: Option<MacAddr>,
+    /// True when the extended flags advertise Apple AWDL Wi-Fi 6 (HE) support
+    /// (bit 8 / high-byte bit 0 of the 16-bit extended flags).
+    pub he: bool,
 }
 
 mod data_path {
     pub const INFRA_INFO: u16 = 0x0001;
     pub const INFRA_ADDRESS: u16 = 0x0002;
     pub const AWDL_ADDRESS: u16 = 0x0004;
+    pub const UMI: u16 = 0x0010;
     pub const COUNTRY_CODE: u16 = 0x0100;
     pub const SOCIAL_CHANNEL_MAP: u16 = 0x0200;
+    pub const LOG_TRIGGER: u16 = 0x1000;
+    pub const EXT_FLAGS: u16 = 0x8000;
+    /// Bit 0 of the high byte (`0x0100` LE16) of the Data Path State extended
+    /// flags: enables Wi-Fi 6 (802.11ax HE) negotiation with Apple devices.
+    pub const EXT_HIGH_EFFICIENCY: u16 = 0x0100;
 }
 
 impl DataPathState {
-    /// Flags, then each optional field the flags announce, as far as legacy
-    /// read them.
+    /// Flags, then each optional field the flags announce, including the
+    /// extended flags HE capability bit when `EXT_FLAGS` (`0x8000`) is set.
     pub fn parse(value: &[u8]) -> Result<DataPathState, Error> {
         use data_path::*;
         let b = Bytes(value);
@@ -318,6 +327,20 @@ impl DataPathState {
         }
         if flags & AWDL_ADDRESS != 0 {
             b.slice(at, 6)?;
+            at += 6;
+        }
+        if flags & EXT_FLAGS != 0 {
+            if flags & UMI != 0 {
+                at += 2;
+            }
+            if flags & LOG_TRIGGER != 0
+                && let Ok(n) = b.le16(at)
+            {
+                at = at.saturating_add(2).saturating_add(n as usize);
+            }
+            if let Ok(ext) = b.le16(at) {
+                out.he = ext & EXT_HIGH_EFFICIENCY != 0;
+            }
         }
         Ok(out)
     }
@@ -411,6 +434,8 @@ pub struct Own<'a> {
     pub election: &'a crate::election::Election,
     pub ht: Option<HtCapabilities>,
     pub vht: Option<VhtCapabilities>,
+    /// Advertise Apple AWDL Wi-Fi 6 (HE) capability bit in TLV 12 extended flags.
+    pub he: bool,
 }
 
 fn tlv(out: &mut Vec<u8>, kind: u8, value: impl FnOnce(&mut Vec<u8>)) {
@@ -527,7 +552,8 @@ pub fn put_vht_capabilities(out: &mut Vec<u8>, vht: &VhtCapabilities) {
 }
 
 /// Data Path State with legacy's flags (`0x8f24`), country `X0`, the master
-/// channel in the social channel map, and our AWDL address.
+/// channel in the social channel map, our AWDL address, and the 16-bit extended
+/// flags (with bit `0x0100` set when `own.he` is true on 5 GHz).
 pub fn put_data_path_state(out: &mut Vec<u8>, own: &Own) {
     tlv(out, kind::DATA_PATH_STATE, |v| {
         v.le16(0x8f24);
@@ -538,7 +564,12 @@ pub fn put_data_path_state(out: &mut Vec<u8>, own: &Own) {
             _ => 0x0004,
         });
         v.mac(own.addr);
-        v.le16(0);
+        let ext_flags = if own.he && own.master_channel.0 > 14 {
+            data_path::EXT_HIGH_EFFICIENCY
+        } else {
+            0
+        };
+        v.le16(ext_flags);
     });
 }
 
@@ -576,10 +607,10 @@ pub fn put_all(out: &mut Vec<u8>, own: &Own, mif: bool) {
     if let Some(ht) = &own.ht {
         put_ht_capabilities(out, ht);
     }
-    if own.master_channel.0 > 14 {
-        if let Some(vht) = &own.vht {
-            put_vht_capabilities(out, vht);
-        }
+    if own.master_channel.0 > 14
+        && let Some(vht) = &own.vht
+    {
+        put_vht_capabilities(out, vht);
     }
     if mif {
         put_arpa(out, own.name);
@@ -616,6 +647,7 @@ mod tests {
             election: &e,
             ht: Some(HtCapabilities::TWO_STREAM),
             vht: Some(VhtCapabilities::TWO_STREAM_80MHZ),
+            he: true,
         };
         let mut out = Vec::new();
         put_all(&mut out, &own, mif);
@@ -644,7 +676,9 @@ mod tests {
         assert_eq!(a.version, Some((VERSION, devclass::MACOS)));
         assert_eq!(a.ht, Some(HtCapabilities::TWO_STREAM));
         assert_eq!(a.vht, Some(VhtCapabilities::TWO_STREAM_80MHZ));
-        assert_eq!(a.data_path.unwrap().country, Some(*b"X0\0"));
+        let dp = a.data_path.unwrap();
+        assert_eq!(dp.country, Some(*b"X0\0"));
+        assert!(dp.he);
         // PSFs leave out only the name.
         let psf = own_frame(false);
         let kinds: Vec<u8> = tlvs(&psf).map(|t| t.unwrap().kind).collect();
@@ -741,6 +775,7 @@ mod tests {
             election: &e,
             ht: Some(HtCapabilities::TWO_STREAM),
             vht: Some(VhtCapabilities::TWO_STREAM_80MHZ),
+            he: true,
         };
         let mut out2g = Vec::new();
         put_all(&mut out2g, &own2g, false);
@@ -749,6 +784,73 @@ mod tests {
                 .map(|t| t.unwrap().kind)
                 .any(|k| k == kind::IEEE80211_CONTAINER)
         );
+        // 2.4 GHz frames do not set the 5 GHz HE bit in TLV 12.
+        assert!(!Advert::parse(&out2g).unwrap().data_path.unwrap().he);
+    }
+
+    #[test]
+    fn data_path_state_he_flag_matches_apple_layout() {
+        let mac = MacAddr([0x02, 0x79, 0x22, 0x55, 0x6d, 0x0d]);
+        let seq = Sequence::fixed(Channel(149));
+        let e = Election::own(mac);
+        let make = |ch: u8, he: bool| {
+            let own = Own {
+                addr: mac,
+                name: "owly",
+                devclass: devclass::MACOS,
+                channel: ch,
+                master_channel: Channel(ch),
+                next_tu: 20,
+                aw_counter: 1,
+                psf_interval_tu: 110,
+                sequence: &seq,
+                election: &e,
+                ht: Some(HtCapabilities::TWO_STREAM),
+                vht: Some(VhtCapabilities::TWO_STREAM_80MHZ),
+                he,
+            };
+            let mut out = Vec::new();
+            put_data_path_state(&mut out, &own);
+            out
+        };
+
+        // 5 GHz with HE enabled: TLV 12 length 15, flags 0x8f24, tlv[16]=0x00, tlv[17]=0x01
+        // (bit 0 of high byte of extended flags at Data Path State value offset 13).
+        let tlv_he = make(149, true);
+        assert_eq!(tlv_he.len(), 18);
+        assert_eq!(tlv_he[0], kind::DATA_PATH_STATE);
+        assert_eq!(u16::from_le_bytes([tlv_he[1], tlv_he[2]]), 15);
+        assert_eq!(u16::from_le_bytes([tlv_he[3], tlv_he[4]]), 0x8f24);
+        assert_eq!(&tlv_he[5..8], b"X0\0");
+        assert_eq!(u16::from_le_bytes([tlv_he[8], tlv_he[9]]), 0x0004);
+        assert_eq!(&tlv_he[10..16], &mac.0);
+        assert_eq!(tlv_he[16], 0x00);
+        assert_eq!(tlv_he[17], 0x01);
+        let parsed = Advert::parse(&tlv_he).unwrap().data_path.unwrap();
+        assert!(parsed.he);
+        assert_eq!(parsed.country, Some(*b"X0\0"));
+
+        // 5 GHz with HE disabled: extended flags stay 0.
+        let tlv_no_he = make(149, false);
+        assert_eq!(tlv_no_he[16], 0x00);
+        assert_eq!(tlv_no_he[17], 0x00);
+        assert!(!Advert::parse(&tlv_no_he).unwrap().data_path.unwrap().he);
+
+        // Complex peer TLV 12 with country + social + infra MAC + UMI + log trigger + ext flags (HE=1).
+        let mut val = Vec::new();
+        let flags: u16 = 0x8000 | 0x1000 | 0x0200 | 0x0100 | 0x0010 | 0x0002;
+        val.extend_from_slice(&flags.to_le_bytes());
+        val.extend_from_slice(b"US\0"); // country (3)
+        val.extend_from_slice(&0x0004u16.to_le_bytes()); // social map (2)
+        val.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]); // infra addr (6)
+        val.extend_from_slice(&[0x00, 0x00]); // UMI (2)
+        val.extend_from_slice(&3u16.to_le_bytes()); // log trigger len = 3
+        val.extend_from_slice(&[1, 2, 3]); // log trigger body
+        val.extend_from_slice(&0x0100u16.to_le_bytes()); // ext flags: HE bit set
+        let dp = DataPathState::parse(&val).unwrap();
+        assert_eq!(dp.country, Some(*b"US\0"));
+        assert_eq!(dp.infra, Some(MacAddr([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])));
+        assert!(dp.he);
     }
 
     // spec: AWDL-5

@@ -31,6 +31,7 @@ extern crate alloc;
 #[cfg(feature = "driver")]
 extern crate std;
 
+pub mod ba_reorder;
 pub mod channel;
 #[cfg(feature = "driver")]
 pub mod driver;

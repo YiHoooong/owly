@@ -35,6 +35,8 @@ const UNICAST_HOLD_US: u64 = 2_000_000;
 const RETRY_US: u64 = 100_000;
 /// How soon to try again once the radio's queue was full.
 const RETRY_PAUSE: Duration = Duration::from_micros(500);
+/// Maximum RX frames drained per wakeup before calling [`Netif::flush_inbound`].
+const RX_BURST_MAX: usize = 64;
 const STATS_EVERY: Duration = Duration::from_secs(10);
 
 /// A frame heard on the air.
@@ -53,6 +55,12 @@ pub trait Air {
     /// The next frame heard. Dropping the future before it's done loses no
     /// frame, since the driver races it against its timers.
     fn recv(&mut self) -> impl Future<Output = io::Result<Received>>;
+
+    /// Non-blocking poll for additional already-queued RX frames so the driver
+    /// can drain an RX burst before calling [`Netif::flush_inbound`].
+    fn try_recv(&mut self) -> Option<Received> {
+        None
+    }
 
     /// Hands a frame to the radio without waiting, at its rate and with or
     /// without an ACK as it says. Gives it back when the radio's queue is
@@ -77,6 +85,11 @@ pub trait Netif {
     /// Hands the host a packet from a peer. One it can't take now is
     /// dropped, as a full queue would drop it.
     fn deliver(&mut self, packet: Ipv6Packet);
+
+    /// Flushes any inbound packets buffered by the interface (e.g., software
+    /// GRO coalesced TCP batches). Called at the end of each RX burst and
+    /// timer tick.
+    fn flush_inbound(&mut self) {}
 
     /// A peer turned valid, and may be reached from now on: an interface
     /// that keeps neighbour entries gets one for its link-local address
@@ -297,10 +310,12 @@ impl<A: Air, N: Netif> Driver<A, N> {
             }
             return;
         }
-        if frame.is_action() {
-            // Built for this moment, its sync TLVs and timestamp with it: by
-            // the next try it would be stale, and the next PSF or MIF is
-            // never far off. Legacy dropped them too.
+        if frame.is_action() && frame.to.is_multicast() {
+            // Broadcast PSFs and MIFs carry timestamps and sync TLVs for this
+            // exact moment: if the radio is full, retrying later would be
+            // stale, and the next PSF/MIF is soon. Unicast BlockAck Action
+            // frames (ADDBA Request/Response) fall through to the lossless
+            // unicast retry queue.
             if self.air.send(frame).is_err() {
                 self.full = true;
                 self.tx.again += 1;
@@ -405,7 +420,7 @@ impl<A: Air, N: Netif> Driver<A, N> {
         let s = self.node.stats();
         let l = &self.lateness;
         tracing::info!(
-            "STATS tx_action {} tx_unicast {} tx_multicast {} tx_amsdu {} | radio full {} gave up {} | rx_action {} rx_data {} rx_malformed {} delivered {} | dropped no_peer {} queue {} expired {} | syn held {} released {} | no_overlap {} | timer late avg {} µs max {} µs",
+            "STATS tx_action {} tx_unicast {} tx_multicast {} tx_amsdu {} | radio full {} gave up {} | rx_action {} rx_data {} rx_malformed {} delivered {} | ba in_order {} reordered {} dup {} holes {} | dropped no_peer {} queue {} expired {} | syn held {} released {} | no_overlap {} | timer late avg {} µs max {} µs",
             s.tx_action,
             s.tx_unicast,
             s.tx_multicast,
@@ -416,6 +431,10 @@ impl<A: Air, N: Netif> Driver<A, N> {
             s.rx_data,
             s.rx_malformed,
             s.delivered,
+            s.ba_in_order,
+            s.ba_reordered,
+            s.ba_duplicates,
+            s.ba_holes,
             s.dropped_no_peer,
             s.dropped_queue_full,
             s.dropped_expired,
@@ -446,6 +465,14 @@ async fn run<A: Air, N: Netif>(mut d: Driver<A, N>) -> Result<(), String> {
                 Ok(rx) => {
                     let now = d.now();
                     d.handle(Input::Frame { rx_time: now, rssi: rx.rssi, bytes: &rx.bytes });
+                    for _ in 1..RX_BURST_MAX {
+                        let Some(more) = d.air.try_recv() else {
+                            break;
+                        };
+                        let now = d.now();
+                        d.handle(Input::Frame { rx_time: now, rssi: more.rssi, bytes: &more.bytes });
+                    }
+                    d.netif.flush_inbound();
                 }
                 Err(e) => return Err(e.to_string()),
             },
@@ -468,6 +495,7 @@ async fn run<A: Air, N: Netif>(mut d: Driver<A, N>) -> Result<(), String> {
                         batch.insert(0, packet);
                         d.handle(Input::OutboundBatch { now, packets: batch });
                     }
+                    d.netif.flush_inbound();
                 }
                 Err(e) => return Err(e.to_string()),
             },
@@ -481,6 +509,7 @@ async fn run<A: Air, N: Netif>(mut d: Driver<A, N>) -> Result<(), String> {
                     l.max = l.max.max(late);
                     d.handle(Input::Timer(now));
                 }
+                d.netif.flush_inbound();
             }
             _ = stats.tick() => d.log_stats(),
             _ = peers.tick() => d.publish_peers(),

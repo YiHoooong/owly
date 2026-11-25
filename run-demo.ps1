@@ -211,8 +211,10 @@ if ($Direct) {
 
 # 5. Build owly.exe arguments and run with full logs
 if (-not $env:RUST_LOG) { $env:RUST_LOG = 'info' }
-# Default to single-MPDU TX under MT7922 firmware RA (zero-loss 5.4 MB/s TX; set OWLY_NO_AMSDU=0 to test A-MSDU).
-if (-not $env:OWLY_NO_AMSDU) { $env:OWLY_NO_AMSDU = '1' }
+# Default to MTU 1500 (override via OWLY_MTU), Software GRO enabled (set OWLY_NO_GRO=1 to disable),
+# and 2-subframe A-MSDU TX enabled under MT7922 HE80 firmware RA (set OWLY_NO_AMSDU=1 to disable).
+if (-not $env:OWLY_MTU) { $env:OWLY_MTU = '1500' }
+if (-not $env:OWLY_NO_AMSDU) { $env:OWLY_NO_AMSDU = '0' }
 $owlyArgs = @()
 switch ($Mode) {
     'radio' {
@@ -252,7 +254,15 @@ if ($Direct -and -not $NoSystem) {
         "set `"OWLY_WINTUN_DLL=$wintun`""
         "set `"OWLY_MTKRADIO_DLL=$directDll`""
         "set `"OWLY_MTK_FW_DIR=$directFwDir`""
+        "set `"OWLY_MTU=$($env:OWLY_MTU)`""
         "set `"OWLY_NO_AMSDU=$($env:OWLY_NO_AMSDU)`""
+        if ($env:OWLY_NO_RX_AMSDU) { "set `"OWLY_NO_RX_AMSDU=$($env:OWLY_NO_RX_AMSDU)`"" }
+        if ($env:OWLY_NO_GRO) { "set `"OWLY_NO_GRO=$($env:OWLY_NO_GRO)`"" }
+        if ($env:OWLY_NO_HE) { "set `"OWLY_NO_HE=$($env:OWLY_NO_HE)`"" }
+        if ($env:OWLY_VHT_MCS) { "set `"OWLY_VHT_MCS=$($env:OWLY_VHT_MCS)`"" }
+        if ($env:OWLY_NO_ACK) { "set `"OWLY_NO_ACK=$($env:OWLY_NO_ACK)`"" }
+        if ($env:OWLY_CONTINUOUS_TX) { "set `"OWLY_CONTINUOUS_TX=$($env:OWLY_CONTINUOUS_TX)`"" }
+        if ($env:OWLY_MTK_VERBOSE) { "set `"OWLY_MTK_VERBOSE=$($env:OWLY_MTK_VERBOSE)`"" }
         "set `"RUST_LOG=$($env:RUST_LOG)`""
         if ($env:OWLY_BEACON_SCRIPT) { "set `"OWLY_BEACON_SCRIPT=$($env:OWLY_BEACON_SCRIPT)`"" }
         "`"$owlyExe`" $quotedArgs > `"$directLog`" 2>&1"

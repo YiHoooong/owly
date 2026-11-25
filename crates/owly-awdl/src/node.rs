@@ -12,11 +12,12 @@ use alloc::collections::{BTreeMap, VecDeque};
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use crate::ba_reorder::{BA_REORDER_TIDS, BaReorder, BaStats, RxOutcome};
 use crate::channel::{Channel, Sequence};
 use crate::election::{Election, Ranking};
 use crate::frame::{self, Frame, Received};
 use crate::ip::Ipv6Packet;
-use crate::peer::{Peer, PeerInfo};
+use crate::peer::{HeldData, Peer, PeerInfo};
 use crate::rate::TxRate;
 use crate::sync::{Clock, MULTICAST_GUARD_US, SLOT_US, UNICAST_GUARD_US};
 use crate::tlv::{self, Advert, HtCapabilities, Own, VhtCapabilities};
@@ -116,7 +117,16 @@ pub struct Config {
     pub initiate_addba: bool,
     /// Send unicast packets to one peer as A-MSDUs, up to the peer's limit.
     pub amsdu: bool,
-    /// The largest frame the radio takes, MAC header included.
+    /// Permit peers to send A-MSDUs inside incoming RX Block Ack A-MPDUs
+    /// (`amsdu_permitted=1` in ADDBA Response when requested by the peer).
+    pub rx_amsdu: bool,
+    /// Advertise Apple AWDL High Efficiency (Wi-Fi 6 / HE) capability bit in
+    /// Data Path State TLV (12) on 5 GHz channels.
+    pub he: bool,
+    /// IPv6 link MTU (default 1500).
+    pub mtu: u16,
+    /// The largest frame the radio takes, MAC header included (default 3800,
+    /// fitting 2x1500B A-MSDUs inside a 4096-byte DMA page and 3895B VHT limit).
     pub max_frame: usize,
     /// Peers heard more weakly than this, in dBm, aren't taken on; known
     /// ones are kept down to 5 dB below. `None` takes any.
@@ -139,6 +149,7 @@ impl Config {
     /// Legacy's defaults.
     pub fn new(addr: MacAddr, name: &str, radio: RadioConstraints) -> Config {
         let no_ack = radio.presence == Presence::Fixed;
+        let he = radio.channel.0 > 14;
         Config {
             addr,
             name: name.into(),
@@ -148,7 +159,10 @@ impl Config {
             accept_addba: false,
             initiate_addba: false,
             amsdu: false,
-            max_frame: 2304,
+            rx_amsdu: true,
+            he,
+            mtu: 1500,
+            max_frame: 3800,
             rssi_threshold: Some(-65),
             neighbour_echo: true,
             max_peers: MAX_PEERS,
@@ -176,6 +190,10 @@ pub struct Stats {
     pub syn_released: u64,
     pub no_overlap: u64,
     pub peers_evicted: u64,
+    pub ba_in_order: u64,
+    pub ba_reordered: u64,
+    pub ba_duplicates: u64,
+    pub ba_holes: u64,
 }
 
 /// Announced in the Version TLV: macOS, as legacy announced.
@@ -396,22 +414,55 @@ impl Node {
                 token,
                 params,
                 timeout,
+                start_seq,
             } if self.cfg.accept_addba
                 && header.dst == self.cfg.addr
                 && self.peers.contains_key(&header.src) =>
             {
                 let seq = self.next_seq();
-                let bytes =
-                    frame::addba_response(self.cfg.addr, header.src, seq, token, params, timeout);
+                let resp = frame::addba_response_with_amsdu(
+                    self.cfg.addr,
+                    header.src,
+                    seq,
+                    token,
+                    params,
+                    timeout,
+                    self.cfg.rx_amsdu,
+                );
                 out.push(Action::Transmit {
                     at: now,
                     frame: Frame {
-                        bytes,
+                        bytes: resp,
                         to: header.src,
                         rate: TxRate::BASIC,
                         no_ack: false,
                     },
                 });
+                let tid = ((params >> 2) & 0x0f) as usize;
+                let win_size = (params >> 6) & 0x3ff;
+                if tid < BA_REORDER_TIDS {
+                    let mut flushed = Vec::new();
+                    let mut stats_delta = None;
+                    if let Some(peer) = self.peers.get_mut(&header.src) {
+                        let keep = peer.rx_ba[tid]
+                            .as_ref()
+                            .is_some_and(|ba| ba.matches_session(token, start_seq, win_size));
+                        if !keep {
+                            if let Some(mut old) = peer.rx_ba[tid].take() {
+                                let before = old.stats();
+                                flushed = old.stop();
+                                stats_delta = Some((before, old.stats()));
+                            }
+                            peer.rx_ba[tid] = Some(BaReorder::new(start_seq, win_size, token));
+                        }
+                    }
+                    if let Some((before, after)) = stats_delta {
+                        self.add_ba_stats(before, after);
+                    }
+                    for h in flushed {
+                        self.deliver_data_body(now, &h.header, h.amsdu, &h.body, out);
+                    }
+                }
             }
             Received::AddBaResponse {
                 header,
@@ -424,11 +475,77 @@ impl Node {
                     peer.tx_ba_active = true;
                 }
             }
+            Received::DelBa {
+                header,
+                tid,
+                initiator,
+                ..
+            } if header.dst == self.cfg.addr => {
+                if initiator {
+                    let tid = tid as usize;
+                    if tid < BA_REORDER_TIDS {
+                        let mut stats_delta = None;
+                        let flushed = if let Some(peer) = self.peers.get_mut(&header.src)
+                            && let Some(mut old) = peer.rx_ba[tid].take()
+                        {
+                            let before = old.stats();
+                            let f = old.stop();
+                            stats_delta = Some((before, old.stats()));
+                            f
+                        } else {
+                            Vec::new()
+                        };
+                        if let Some((before, after)) = stats_delta {
+                            self.add_ba_stats(before, after);
+                        }
+                        for h in flushed {
+                            self.deliver_data_body(now, &h.header, h.amsdu, &h.body, out);
+                        }
+                    }
+                } else if tid == 0
+                    && let Some(peer) = self.peers.get_mut(&header.src)
+                {
+                    peer.tx_ba_active = false;
+                }
+            }
+            Received::BlockAckReq {
+                dst,
+                src,
+                tid,
+                start_seq,
+            } if dst == self.cfg.addr => {
+                let tid = tid as usize;
+                if tid < BA_REORDER_TIDS {
+                    let mut stats_delta = None;
+                    let released = if let Some(peer) = self.peers.get_mut(&src) {
+                        peer.last_seen = now;
+                        if let Some(ba) = peer.rx_ba[tid].as_mut() {
+                            let before = ba.stats();
+                            let r = ba.bar(start_seq);
+                            stats_delta = Some((before, ba.stats()));
+                            r
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        Vec::new()
+                    };
+                    if let Some((before, after)) = stats_delta {
+                        self.add_ba_stats(before, after);
+                    }
+                    for h in released {
+                        self.deliver_data_body(now, &h.header, h.amsdu, &h.body, out);
+                    }
+                }
+            }
             Received::Data {
                 header,
                 amsdu,
                 body,
-            } if header.src != self.cfg.addr => self.rx_data(now, &header, amsdu, body, out),
+            } if header.src != self.cfg.addr => {
+                let tid = frame::qos_tid(bytes);
+                self.rx_data(now, &header, tid, amsdu, body, out)
+            }
             _ => {}
         }
     }
@@ -485,7 +602,70 @@ impl Node {
         }
     }
 
+    fn add_ba_stats(&mut self, before: BaStats, after: BaStats) {
+        self.stats.ba_in_order += after.in_order.saturating_sub(before.in_order);
+        self.stats.ba_reordered += after.reordered.saturating_sub(before.reordered);
+        self.stats.ba_duplicates += after.duplicates.saturating_sub(before.duplicates);
+        self.stats.ba_holes += after.holes_skipped.saturating_sub(before.holes_skipped);
+    }
+
     fn rx_data(
+        &mut self,
+        now: Time,
+        header: &frame::Header,
+        tid: Option<u8>,
+        amsdu: bool,
+        body: &[u8],
+        out: &mut Vec<Action>,
+    ) {
+        if header.dst == self.cfg.addr
+            && let Some(tid) = tid
+            && (tid as usize) < BA_REORDER_TIDS
+        {
+            let outcome = if let Some(peer) = self.peers.get_mut(&header.src) {
+                peer.last_seen = now;
+                if let Some(ba) = peer.rx_ba[tid as usize].as_mut() {
+                    let before = ba.stats();
+                    let res = ba.rx(header.seq, now, || HeldData {
+                        header: *header,
+                        amsdu,
+                        body: body.to_vec(),
+                    });
+                    let after = ba.stats();
+                    Some((res, before, after))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            if let Some((outcome, before_stats, after_stats)) = outcome {
+                self.add_ba_stats(before_stats, after_stats);
+                match outcome {
+                    RxOutcome::Duplicate => return,
+                    RxOutcome::DeliverNow { before, after } => {
+                        for h in before {
+                            self.deliver_data_body(now, &h.header, h.amsdu, &h.body, out);
+                        }
+                        self.deliver_data_body(now, header, amsdu, body, out);
+                        for h in after {
+                            self.deliver_data_body(now, &h.header, h.amsdu, &h.body, out);
+                        }
+                        return;
+                    }
+                    RxOutcome::Buffered { before } => {
+                        for h in before {
+                            self.deliver_data_body(now, &h.header, h.amsdu, &h.body, out);
+                        }
+                        return;
+                    }
+                }
+            }
+        }
+        self.deliver_data_body(now, header, amsdu, body, out);
+    }
+
+    fn deliver_data_body(
         &mut self,
         now: Time,
         header: &frame::Header,
@@ -593,6 +773,7 @@ impl Node {
     }
 
     fn service(&mut self, now: Time, out: &mut Vec<Action>) {
+        self.poll_ba_reorder(now, out);
         if now >= self.next_tick {
             self.tick(now, out);
             while self.next_tick <= now {
@@ -639,6 +820,33 @@ impl Node {
         self.send_unicast(now, &mut sent, out);
         if sent >= BURST {
             self.resume = Some(now.plus(BURST_PAUSE_US));
+        }
+    }
+
+    fn poll_ba_reorder(&mut self, now: Time, out: &mut Vec<Action>) {
+        let mut flushed = Vec::new();
+        let mut deltas = Vec::new();
+        for peer in self.peers.values_mut() {
+            for ba in peer.rx_ba.iter_mut().flatten() {
+                if ba.stored() == 0 {
+                    continue;
+                }
+                let before = ba.stats();
+                let released = ba.timeout(now);
+                let after = ba.stats();
+                if !released.is_empty() {
+                    flushed.extend(released);
+                }
+                if after != before {
+                    deltas.push((before, after));
+                }
+            }
+        }
+        for (before, after) in deltas {
+            self.add_ba_stats(before, after);
+        }
+        for h in flushed {
+            self.deliver_data_body(now, &h.header, h.amsdu, &h.body, out);
         }
     }
 
@@ -731,6 +939,7 @@ impl Node {
             election: &self.election,
             ht: Some(HT),
             vht: (self.cfg.radio.channel.0 > 14).then_some(VHT),
+            he: self.cfg.he && self.cfg.radio.channel.0 > 14,
         };
         let mif = subtype == frame::subtype::MIF;
         let bytes = frame::action_frame(self.cfg.addr, seq, subtype, now.micros() as u32, |out| {
@@ -862,11 +1071,18 @@ impl Node {
                     .min(self.cfg.max_frame.saturating_sub(frame::HEADER_LEN + 2));
                 let mut len = frame::amsdu_subframe_len(batch[0].packet.data.len());
                 let mut rest = VecDeque::new();
+                let mut dst_full = false;
                 while let Some(next) = items.pop_front() {
-                    let add = frame::amsdu_subframe_len(next.packet.data.len()) + 3;
-                    if next.packet.dst == dst && batch.len() < AMSDU_PACKETS && len + add <= limit {
-                        len += add;
-                        batch.push(next);
+                    if next.packet.dst == dst {
+                        let pad = (4 - len % 4) % 4;
+                        let add = pad + frame::amsdu_subframe_len(next.packet.data.len());
+                        if !dst_full && batch.len() < AMSDU_PACKETS && len + add <= limit {
+                            len += add;
+                            batch.push(next);
+                        } else {
+                            dst_full = true;
+                            rest.push_back(next);
+                        }
                     } else {
                         rest.push_back(next);
                     }
@@ -963,6 +1179,13 @@ impl Node {
             seen.push(q.packet.dst);
             if let Some(p) = self.peers.get(&q.packet.dst) {
                 t = t.min(now.plus(self.unicast_wait(p, now).max(1)));
+            }
+        }
+        for p in self.peers.values() {
+            for ba in p.rx_ba.iter().flatten() {
+                if let Some(exp) = ba.next_timeout() {
+                    t = t.min(exp);
+                }
             }
         }
         t.max(now)
