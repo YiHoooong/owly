@@ -15,7 +15,7 @@ use std::net::Ipv6Addr;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering, fence};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,7 @@ use owly_awdl::frame::Frame;
 use owly_awdl::{Config, Ipv6Packet, PeerInfo, TxRate};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf};
 use tokio::net::windows::named_pipe::{ClientOptions, NamedPipeClient};
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Notify, mpsc, watch};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_NO_MORE_ITEMS, ERROR_OBJECT_ALREADY_EXISTS, ERROR_PIPE_BUSY, FreeLibrary,
     HANDLE, HMODULE, NO_ERROR, WAIT_OBJECT_0,
@@ -45,8 +45,14 @@ use windows_sys::Win32::Security::{
     TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES, TOKEN_QUERY, TokenPrivileges,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+use windows_sys::Win32::System::Memory::{
+    FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, OpenFileMappingA,
+    UnmapViewOfFile,
+};
 use windows_sys::Win32::System::Threading::{
-    CreateEventW, GetCurrentProcess, INFINITE, OpenProcessToken, SetEvent, WaitForMultipleObjects,
+    CreateEventW, EVENT_MODIFY_STATE, GetCurrentProcess, INFINITE, OpenEventA, OpenProcessToken,
+    ResetEvent, SYNCHRONIZATION_SYNCHRONIZE, SetEvent, WaitForMultipleObjects,
+    WaitForSingleObject,
 };
 
 use crate::radiotap;
@@ -287,13 +293,281 @@ pub fn lookup_interface(name: &str) -> io::Result<(u32, Ipv6Addr)> {
     Ok((index, addr))
 }
 
-/// Cancel-safe Windows Named Pipe `Air` implementation for `mtkradio.exe`.
+// ---------------------------------------------------------------------------
+// Lock-free SPSC Shared-Memory data plane (matches nekodrop radio_shm.h ABI)
+// ---------------------------------------------------------------------------
+
+const RADIO_SHM_MAGIC: u32 = 0x4E4B_5348; // "NKSH"
+const RADIO_SHM_VERSION: u32 = 1;
+const RADIO_SHM_RING_SIZE: usize = 4 * 1024 * 1024; // 4 MiB power-of-2
+const RADIO_SHM_RING_MASK: usize = RADIO_SHM_RING_SIZE - 1;
+const RADIO_LINK_CAP_SHM_GLOBAL: u8 = 1;
+const RADIO_LINK_CAP_SHM_LOCAL: u8 = 2;
+
+#[repr(C)]
+struct RadioShmRing {
+    write_pos: AtomicI32,
+    pad0: [i32; 15],
+    read_pos: AtomicI32,
+    waiting: AtomicI32,
+    pad1: [i32; 14],
+    data: [u8; RADIO_SHM_RING_SIZE],
+}
+
+#[repr(C)]
+struct RadioShmLayout {
+    magic: u32,
+    version: u32,
+    epoch: AtomicI32,
+    client_ready: AtomicI32,
+    reserved: [u32; 12],
+    rx: RadioShmRing, // radio -> owly
+    tx: RadioShmRing, // owly -> radio
+}
+
+struct RadioShmClient {
+    mapping: SendHandle,
+    rx_event: SendHandle,
+    tx_event: SendHandle,
+    layout: *mut RadioShmLayout,
+    stop: Arc<AtomicBool>,
+    rx_notify: Arc<Notify>,
+    wake_thread: Option<JoinHandle<()>>,
+    scratch_rx: Vec<u8>,
+    scratch_tx: Vec<u8>,
+}
+
+// SAFETY: `RadioShmClient` owns its Win32 handles and mapped view exclusively
+// and only accesses atomic/lock-free fields shared with the radio daemon.
+#[allow(unsafe_code)]
+unsafe impl Send for RadioShmClient {}
+
+impl RadioShmClient {
+    fn open(cap_flag: u8) -> Option<Self> {
+        let (map_name, rx_name, tx_name): (&[u8], &[u8], &[u8]) =
+            if (cap_flag & RADIO_LINK_CAP_SHM_GLOBAL) != 0 {
+                (
+                    b"Global\\nekodrop-radio-shm-v1\0",
+                    b"Global\\nekodrop-radio-shm-rx-v1\0",
+                    b"Global\\nekodrop-radio-shm-tx-v1\0",
+                )
+            } else if (cap_flag & RADIO_LINK_CAP_SHM_LOCAL) != 0 {
+                (
+                    b"Local\\nekodrop-radio-shm-v1\0",
+                    b"Local\\nekodrop-radio-shm-rx-v1\0",
+                    b"Local\\nekodrop-radio-shm-tx-v1\0",
+                )
+            } else {
+                return None;
+            };
+
+        let sz = std::mem::size_of::<RadioShmLayout>();
+        #[allow(unsafe_code)]
+        unsafe {
+            let mapping = OpenFileMappingA(FILE_MAP_ALL_ACCESS, 0, map_name.as_ptr());
+            if mapping.is_null() {
+                tracing::debug!("SHM OpenFileMappingA failed: {}", io::Error::last_os_error());
+                return None;
+            }
+            let view = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, sz);
+            if view.Value.is_null() {
+                CloseHandle(mapping);
+                return None;
+            }
+            let layout = view.Value.cast::<RadioShmLayout>();
+            if (*layout).magic != RADIO_SHM_MAGIC || (*layout).version != RADIO_SHM_VERSION {
+                UnmapViewOfFile(view);
+                CloseHandle(mapping);
+                return None;
+            }
+            let access = EVENT_MODIFY_STATE | SYNCHRONIZATION_SYNCHRONIZE;
+            let rx_event = OpenEventA(access, 0, rx_name.as_ptr());
+            let tx_event = OpenEventA(access, 0, tx_name.as_ptr());
+            if rx_event.is_null() || tx_event.is_null() {
+                if !rx_event.is_null() {
+                    CloseHandle(rx_event);
+                }
+                if !tx_event.is_null() {
+                    CloseHandle(tx_event);
+                }
+                UnmapViewOfFile(view);
+                CloseHandle(mapping);
+                return None;
+            }
+
+            let stop = Arc::new(AtomicBool::new(false));
+            let rx_notify = Arc::new(Notify::new());
+            let stop_bg = Arc::clone(&stop);
+            let notify_bg = Arc::clone(&rx_notify);
+            let rx_ev_bg = SendHandle(rx_event);
+            let wake_thread = thread::Builder::new()
+                .name("owly-shm-rx".into())
+                .spawn(move || {
+                    let rx_ev = rx_ev_bg;
+                    while !stop_bg.load(Ordering::Relaxed) {
+                        let rc = WaitForSingleObject(rx_ev.0, 20);
+                        if stop_bg.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        if rc == WAIT_OBJECT_0 {
+                            ResetEvent(rx_ev.0);
+                            notify_bg.notify_one();
+                        }
+                    }
+                })
+                .ok();
+
+            (*layout).client_ready.store(1, Ordering::Release);
+            fence(Ordering::SeqCst);
+
+            tracing::info!(
+                "mtkradio lock-free SHM data plane attached (4 MiB RX + 4 MiB TX, cap={cap_flag})"
+            );
+            Some(Self {
+                mapping: SendHandle(mapping),
+                rx_event: SendHandle(rx_event),
+                tx_event: SendHandle(tx_event),
+                layout,
+                stop,
+                rx_notify,
+                wake_thread,
+                scratch_rx: Vec::with_capacity(PIPE_MAX_BODY),
+                scratch_tx: Vec::with_capacity(4096),
+            })
+        }
+    }
+
+    #[inline]
+    fn write_bytes(ring: &mut [u8; RADIO_SHM_RING_SIZE], pos: u32, src: &[u8]) {
+        let idx = (pos as usize) & RADIO_SHM_RING_MASK;
+        let first = src.len().min(RADIO_SHM_RING_SIZE - idx);
+        ring[idx..idx + first].copy_from_slice(&src[..first]);
+        if src.len() > first {
+            ring[..src.len() - first].copy_from_slice(&src[first..]);
+        }
+    }
+
+    #[inline]
+    fn read_bytes(ring: &[u8; RADIO_SHM_RING_SIZE], pos: u32, dst: &mut [u8]) {
+        let total = dst.len();
+        let idx = (pos as usize) & RADIO_SHM_RING_MASK;
+        let first = total.min(RADIO_SHM_RING_SIZE - idx);
+        dst[..first].copy_from_slice(&ring[idx..idx + first]);
+        if total > first {
+            dst[first..].copy_from_slice(&ring[..total - first]);
+        }
+    }
+
+    fn pop_rx(&mut self) -> Option<Received> {
+        #[allow(unsafe_code)]
+        unsafe {
+            let ring = &mut (*self.layout).rx;
+            loop {
+                let r = ring.read_pos.load(Ordering::Relaxed) as u32;
+                let w = ring.write_pos.load(Ordering::Acquire) as u32;
+                if w == r {
+                    return None;
+                }
+                let mut len_bytes = [0u8; 4];
+                Self::read_bytes(&ring.data, r, &mut len_bytes);
+                let len = u32::from_le_bytes(len_bytes) as usize;
+                let total = (4 + len + 3) & !3;
+                if len == 0 || len > PIPE_MAX_BODY || (w.wrapping_sub(r) as usize) < total {
+                    ring.read_pos.store(w as i32, Ordering::Release);
+                    return None;
+                }
+                self.scratch_rx.resize(len, 0);
+                Self::read_bytes(&ring.data, r.wrapping_add(4), &mut self.scratch_rx);
+                fence(Ordering::SeqCst);
+                ring.read_pos
+                    .store(r.wrapping_add(total as u32) as i32, Ordering::Release);
+                if let Some(rx) = radiotap::parse(&self.scratch_rx) {
+                    return Some(Received {
+                        bytes: rx.frame.to_vec(),
+                        rssi: rx.rssi,
+                    });
+                }
+            }
+        }
+    }
+
+    fn arm_rx_wait(&self) -> bool {
+        #[allow(unsafe_code)]
+        unsafe {
+            let ring = &(*self.layout).rx;
+            ring.waiting.store(1, Ordering::SeqCst);
+            let r = ring.read_pos.load(Ordering::SeqCst) as u32;
+            let w = ring.write_pos.load(Ordering::SeqCst) as u32;
+            if w != r {
+                ring.waiting.store(0, Ordering::Release);
+                return false;
+            }
+            true
+        }
+    }
+
+    fn push_tx(&mut self, frame: &Frame) -> bool {
+        self.scratch_tx.clear();
+        write_tx_radiotap(&mut self.scratch_tx, frame.rate, frame.no_ack);
+        self.scratch_tx.extend_from_slice(&frame.bytes);
+        let len = self.scratch_tx.len();
+        if len == 0 || len > PIPE_MAX_BODY {
+            return true;
+        }
+        let total = (4 + len + 3) & !3;
+        #[allow(unsafe_code)]
+        unsafe {
+            let ring = &mut (*self.layout).tx;
+            let w = ring.write_pos.load(Ordering::Relaxed) as u32;
+            let r = ring.read_pos.load(Ordering::Acquire) as u32;
+            let used = w.wrapping_sub(r) as usize;
+            if RADIO_SHM_RING_SIZE - used < total {
+                return false;
+            }
+            let len_bytes = (len as u32).to_le_bytes();
+            Self::write_bytes(&mut ring.data, w, &len_bytes);
+            Self::write_bytes(&mut ring.data, w.wrapping_add(4), &self.scratch_tx);
+            fence(Ordering::SeqCst);
+            ring.write_pos
+                .store(w.wrapping_add(total as u32) as i32, Ordering::Release);
+            SetEvent(self.tx_event.0);
+            true
+        }
+    }
+}
+
+impl Drop for RadioShmClient {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+        #[allow(unsafe_code)]
+        unsafe {
+            (*self.layout).client_ready.store(0, Ordering::Release);
+            SetEvent(self.rx_event.0);
+        }
+        if let Some(t) = self.wake_thread.take() {
+            let _ = t.join();
+        }
+        #[allow(unsafe_code)]
+        unsafe {
+            UnmapViewOfFile(MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: self.layout.cast(),
+            });
+            CloseHandle(self.rx_event.0);
+            CloseHandle(self.tx_event.0);
+            CloseHandle(self.mapping.0);
+        }
+    }
+}
+
+/// Cancel-safe Windows Named Pipe `Air` implementation for `mtkradio.exe`
+/// (automatically upgrades to lock-free 4 MiB RX + 4 MiB TX SHM when advertised).
 struct PipeAir {
     rx: ReadHalf<NamedPipeClient>,
     tx: mpsc::Sender<Vec<u8>>,
     rx_buf: Vec<u8>,
     rx_start: usize,
     rx_end: usize,
+    shm: Option<RadioShmClient>,
 }
 
 impl PipeAir {
@@ -342,6 +616,7 @@ impl PipeAir {
             rx_buf: vec![0u8; PIPE_RX_BUF],
             rx_start: 0,
             rx_end: 0,
+            shm: None,
         })
     }
 }
@@ -451,12 +726,17 @@ impl PipeAir {
             } else if msg_type == RADIO_LINK_HELLO && body_len >= 8 {
                 let b = &self.rx_buf[body_start..body_end];
                 let ver = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+                let cap_flag = b[6];
                 tracing::info!(
-                    "mtkradio pipe hello: version={} ch={} width={}MHz",
+                    "mtkradio pipe hello: version={} ch={} width={}MHz shm_cap={}",
                     ver,
                     b[4],
-                    b[5]
+                    b[5],
+                    cap_flag
                 );
+                if self.shm.is_none() && cap_flag != 0 {
+                    self.shm = RadioShmClient::open(cap_flag);
+                }
             }
         }
     }
@@ -465,6 +745,11 @@ impl PipeAir {
 impl Air for PipeAir {
     async fn recv(&mut self) -> io::Result<Received> {
         loop {
+            if let Some(shm) = self.shm.as_mut() {
+                if let Some(rx) = shm.pop_rx() {
+                    return Ok(rx);
+                }
+            }
             if let Some(rx) = self.pop_buffered()? {
                 return Ok(rx);
             }
@@ -475,22 +760,52 @@ impl Air for PipeAir {
                 self.rx_start = 0;
             }
 
-            let n = self.rx.read(&mut self.rx_buf[self.rx_end..]).await?;
-            if n == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "mtkradio pipe closed",
-                ));
+            if let Some(shm) = self.shm.as_ref() {
+                if !shm.arm_rx_wait() {
+                    continue;
+                }
+                let notify = Arc::clone(&shm.rx_notify);
+                tokio::select! {
+                    _ = notify.notified() => {
+                        continue;
+                    }
+                    res = self.rx.read(&mut self.rx_buf[self.rx_end..]) => {
+                        let n = res?;
+                        if n == 0 {
+                            return Err(io::Error::new(
+                                io::ErrorKind::UnexpectedEof,
+                                "mtkradio pipe closed",
+                            ));
+                        }
+                        self.rx_end += n;
+                    }
+                }
+            } else {
+                let n = self.rx.read(&mut self.rx_buf[self.rx_end..]).await?;
+                if n == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "mtkradio pipe closed",
+                    ));
+                }
+                self.rx_end += n;
             }
-            self.rx_end += n;
         }
     }
 
     fn try_recv(&mut self) -> Option<Received> {
+        if let Some(shm) = self.shm.as_mut() {
+            if let Some(rx) = shm.pop_rx() {
+                return Some(rx);
+            }
+        }
         self.pop_buffered().ok().flatten()
     }
 
     fn send(&mut self, frame: Frame) -> Result<(), Frame> {
+        if let Some(shm) = self.shm.as_mut() {
+            return if shm.push_tx(&frame) { Ok(()) } else { Err(frame) };
+        }
         let mut buf = Vec::with_capacity(8 + 16 + frame.bytes.len());
         buf.extend_from_slice(&RADIO_LINK_TX.to_le_bytes());
         buf.extend_from_slice(&0u16.to_le_bytes());
